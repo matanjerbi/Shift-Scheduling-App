@@ -1,0 +1,12 @@
+name = "shifts-api"
+main = "src/index.js"
+compatibility_date = "2025-06-01"
+workers_dev = true
+
+# APP_PASSWORD is set as a Worker secret by the deploy workflow.
+
+[[d1_databases]]
+binding = "DB"
+database_name = "shifts-db"
+database_id = "b2afe76d-9233-4c35-a3f4-b5acb629b3e1"
+migrations_dir = "migrations"

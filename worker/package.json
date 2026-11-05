@@ -1,0 +1,7 @@
+{
+  "name": "shifts-api",
+  "private": true,
+  "type": "module",
+  "scripts": { "test": "node --test test/*.cjs" },
+  "devDependencies": { "wrangler": "^4.20.0" }
+}
