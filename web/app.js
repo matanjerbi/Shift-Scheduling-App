@@ -17,6 +17,16 @@
     calc: { scope: 'open', mode: 'amount', amount: '', rate: '', exclude: [] },
     loading: false,
     syncedAt: null,
+    blocked: false,
+    device: (() => {
+      let d = LS.get('shifts.device', '');
+      if (!/^[a-zA-Z0-9_-]{8,64}$/.test(d)) {
+        d = (crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2) + Date.now().toString(36)).replace(/[^a-zA-Z0-9]/g, '');
+        LS.set('shifts.device', d);
+      }
+      return d;
+    })(),
+    admin: { pw: LS.get('shifts.admin', ''), tab: 'overview', overview: null, log: null, logType: 'all', logDevice: '', busy: false },
   };
 
   const $app = document.getElementById('app');
@@ -31,7 +41,7 @@
   async function api(method, path, body) {
     const res = await fetch(API + path, {
       method,
-      headers: { 'Content-Type': 'application/json', 'X-App-Password': S.pass },
+      headers: { 'Content-Type': 'application/json', 'X-App-Password': S.pass, 'X-Device': S.device },
       body: body ? JSON.stringify(body) : undefined,
     });
     let data = {};
@@ -40,6 +50,7 @@
       S.pass = ''; LS.del('shifts.pass'); S.data = null; render();
       throw new Error('סיסמה שגויה');
     }
+    if (res.status === 403 && data.error === 'המכשיר הזה נחסם') { S.blocked = true; render(); throw new Error(data.error); }
     if (!res.ok) throw new Error(data.error || 'שגיאה ' + res.status);
     if (data.workers) { S.data = data; S.syncedAt = new Date(); }
     return data;
@@ -58,10 +69,12 @@
     }
   }
 
-  async function load() {
+  // first=true is a real app open and gets logged; refreshes are not
+  async function load(first) {
     try {
       S.loading = true;
-      await api('GET', '/api/state');
+      if (first) await api('POST', '/api/hello', { event: 'open' });
+      else await api('GET', '/api/state');
     } catch (e) {
       if (S.pass) toast(e.message);
     } finally {
@@ -122,19 +135,24 @@
       $app.innerHTML = `<div class="login card"><h1>חסרה כתובת שרת</h1><p class="muted">הקובץ config.js לא הוגדר.</p></div>`;
       return;
     }
+    if (S.blocked) {
+      $app.innerHTML = `<div class="login card"><h1>אין גישה</h1><p class="muted">המכשיר הזה נחסם על ידי מנהל האפליקציה.</p></div>`;
+      return;
+    }
     if (!S.pass || !S.data) {
       if (S.pass && S.loading) { $app.innerHTML = `<div class="login"><p class="muted">טוען…</p></div>`; return; }
       return renderLogin();
     }
-    const views = { home: viewHome, shifts: viewShifts, pay: viewPay, calc: viewCalc, settings: viewSettings };
+    const views = { home: viewHome, shifts: viewShifts, pay: viewPay, calc: viewCalc, settings: viewSettings, admin: viewAdmin };
     const body = (views[S.view] || viewHome)();
     const sync = S.syncedAt ? `עודכן ${S.syncedAt.toLocaleTimeString('he-IL', { hour: '2-digit', minute: '2-digit' })}` : '';
     $app.innerHTML = `
       <header><div class="row"><h1>משמרות</h1><span class="sync" onclick="App.reload()">${sync} ↻</span></div></header>
       <main>${body}</main>
       ${S.view === 'shifts' || S.view === 'home' ? `<button class="fab" onclick="App.newShift()"><span style="font-size:20px;line-height:1">+</span> משמרת</button>` : ''}
-      <nav><div class="in">${TABS.map(([k, t]) => `<button class="${S.view === k ? 'on' : ''}" onclick="App.go('${k}')">${TAB_ICON[k]}${t}</button>`).join('')}</div></nav>`;
+      <nav><div class="in">${TABS.map(([k, t]) => `<button class="${S.view === k || (k === 'settings' && S.view === 'admin') ? 'on' : ''}" onclick="App.go('${k}')">${TAB_ICON[k]}${t}</button>`).join('')}</div></nav>`;
     if (S.view === 'calc') bindCalc();
+    if (S.view === 'admin') bindAdmin();
   }
 
   function renderLogin() {
@@ -153,7 +171,7 @@
       S.pass = document.getElementById('pw').value.trim();
       if (!S.pass) return;
       try {
-        await api('GET', '/api/state');
+        await api('POST', '/api/hello', { event: 'login' });
         LS.set('shifts.pass', S.pass);
         render();
       } catch (err) { toast(err.message); }
@@ -521,6 +539,8 @@
         <div class="avatar">${esc(w.name[0] || '?')}</div><div><div class="name">${esc(w.name)}${w.active ? '' : ' <span class="tag">לא פעיל</span>'}</div>
         <div class="meta">${w.rate !== null && w.rate !== undefined ? 'תעריף אישי ' + N(C.fmtMoney(w.rate)) : 'תעריף ברירת מחדל'}</div></div></div>`).join('')}</div>
       <button class="btn ghost block" style="margin-top:10px" onclick="App.worker(0)">+ הוספת עובד</button>
+      <h2>ניהול</h2>
+      <div class="card"><button class="btn dark block" onclick="App.go('admin')">אזור ניהול — כניסות ולוגים</button></div>
       <h2>נתונים</h2>
       <div class="card stack">
         <button class="btn ghost block" onclick="App.csv()">ייצוא לאקסל (CSV)</button>
@@ -557,10 +577,344 @@
     a.click();
   }
 
+  // ---------- Admin ----------
+  const A = S.admin;
+
+  async function adminApi(method, path, body) {
+    const res = await fetch(API + path, {
+      method,
+      headers: { 'Content-Type': 'application/json', 'X-App-Password': S.pass, 'X-Device': S.device, 'X-Admin-Password': A.pw },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    let data = {};
+    try { data = await res.json(); } catch {}
+    if (res.status === 403 || res.status === 429) {
+      if (res.status === 403) { A.pw = ''; LS.del('shifts.admin'); A.overview = null; A.log = null; }
+      render();
+      throw new Error(data.error || 'אין הרשאה');
+    }
+    if (!res.ok) throw new Error(data.error || 'שגיאה ' + res.status);
+    return data;
+  }
+
+  function parseUA(ua) {
+    ua = ua || '';
+    const os = /iPhone/.test(ua) ? 'iPhone' : /iPad/.test(ua) ? 'iPad' : /Android/.test(ua) ? 'Android'
+      : /Windows/.test(ua) ? 'Windows' : /Mac OS X|Macintosh/.test(ua) ? 'Mac' : /Linux/.test(ua) ? 'Linux' : 'מכשיר';
+    const br = /SamsungBrowser/.test(ua) ? 'Samsung' : /EdgA?\//.test(ua) ? 'Edge' : /Firefox|FxiOS/.test(ua) ? 'Firefox'
+      : /CriOS|Chrome/.test(ua) ? 'Chrome' : /Safari/.test(ua) ? 'Safari' : '';
+    let model = '';
+    const m = /Android [\d.]+; ([^;)]+)\)/.exec(ua);
+    if (m && !/^K$/.test(m[1].trim())) model = m[1].trim();
+    return { os, br, model, text: [os, model, br].filter(Boolean).join(' · ') };
+  }
+  const devMap = () => {
+    const out = {};
+    for (const d of (A.overview && A.overview.devices) || []) out[d.id] = d;
+    return out;
+  };
+  function devName(id, ua) {
+    if (!id) return 'מכשיר לא מזוהה';
+    const d = devMap()[id];
+    if (d && d.label) return d.label;
+    const p = parseUA((d && d.user_agent) || ua);
+    return p.text + ' #' + id.slice(0, 4);
+  }
+  const isMe = (id) => id === S.device;
+
+  const toDate = (ts) => new Date(String(ts).replace(' ', 'T') + 'Z');
+  function fmtTs(ts) {
+    const d = toDate(ts);
+    return d.toLocaleString('he-IL', { day: 'numeric', month: 'numeric', hour: '2-digit', minute: '2-digit' });
+  }
+  function ago(ts) {
+    const s = (Date.now() - toDate(ts).getTime()) / 1000;
+    if (s < 60) return 'עכשיו';
+    if (s < 3600) return `לפני ${Math.floor(s / 60)} דק׳`;
+    if (s < 86400) return `לפני ${Math.floor(s / 3600)} שע׳`;
+    if (s < 86400 * 7) return `לפני ${Math.floor(s / 86400)} ימים`;
+    return fmtTs(ts);
+  }
+
+  const FIELD = {
+    date: 'תאריך', worker_id: 'עובד', start_time: 'התחלה', end_time: 'סיום', extra_minutes: 'תוספת',
+    hours_override: 'סך ידני', note: 'הערה', period_id: 'תשלום', name: 'שם', rate: 'תעריף', active: 'פעיל',
+    amount_received: 'סכום', default_rate: 'תעריף ברירת מחדל',
+  };
+  function fieldVal(k, v) {
+    if (v === null || v === undefined || v === '') return '—';
+    if (k === 'worker_id') return wName(v);
+    if (k === 'date') return C.dayName(v) + ' ' + C.fmtDate(v);
+    if (k === 'extra_minutes') return (v > 0 ? '+' : '') + C.fmtHM(v);
+    if (k === 'hours_override') return C.fmtHM(Math.round(v * 60));
+    if (k === 'period_id') return 'שולם';
+    if (k === 'rate' || k === 'amount_received' || k === 'default_rate') return C.fmtMoney(Number(v));
+    if (k === 'active') return v ? 'כן' : 'לא';
+    return String(v);
+  }
+  function shiftLine(s) {
+    if (!s) return '';
+    const t = s.hours_override !== null && s.hours_override !== undefined ? 'סך ידני' : `${s.start_time}–${s.end_time}`;
+    return `${wName(s.worker_id)} · ${C.dayName(s.date)} ${C.fmtDate(s.date)} · ${t} (${C.fmtHM(C.shiftMinutes(s))})`;
+  }
+  const VERB = { create: 'הוסיף', update: 'עדכן', delete: 'מחק', close: 'סגר', reopen: 'פתח מחדש', settings: 'שינה' };
+  const NOUN = { shift: 'משמרת', worker: 'עובד', period: 'תקופת תשלום', settings: 'הגדרות', admin_password: 'סיסמת ניהול' };
+
+  function describe(it) {
+    if (it.kind === 'visit') {
+      const ev = {
+        open: ['פתח את האפליקציה', '●', 'var(--muted)'],
+        login: ['נכנס עם סיסמה', '→', 'var(--paid)'],
+        login_failed: ['ניסיון כניסה עם סיסמה שגויה', '!', 'var(--danger)'],
+        admin_login: ['נכנס לאזור הניהול', '★', 'var(--accent)'],
+        admin_failed: ['סיסמת ניהול שגויה', '!', 'var(--danger)'],
+      }[it.action] || [it.action, '●', 'var(--muted)'];
+      return { title: ev[0], sub: '', icon: ev[1], color: ev[2] };
+    }
+    const b = it.before_json ? JSON.parse(it.before_json) : null;
+    const a = it.after_json ? JSON.parse(it.after_json) : null;
+    let title = `${VERB[it.action] || it.action} ${NOUN[it.entity] || it.entity}`;
+    let sub = '';
+    if (it.entity === 'shift') sub = shiftLine(a || b);
+    else if (it.entity === 'worker') sub = (a || b || {}).name || '';
+    else if (it.entity === 'period') {
+      const p = a || b || {};
+      sub = `${p.name || ''}${p.amount_received ? ' · ' + C.fmtMoney(p.amount_received) : ''}${p.shift_ids ? ' · ' + p.shift_ids.length + ' משמרות' : ''}`;
+    } else if (it.entity === 'settings' && a && b) {
+      title = 'עדכן תעריף ברירת מחדל';
+      sub = `${C.fmtMoney(b.default_rate)} ← ${C.fmtMoney(a.default_rate)}`;
+    }
+    if (it.action === 'update' && b && a && it.entity !== 'settings') {
+      const ch = Object.keys(FIELD).filter((k) => k in a && String(a[k] ?? '') !== String(b[k] ?? ''));
+      if (ch.length) sub += (sub ? ' · ' : '') + 'שונה: ' + ch.map((k) => FIELD[k]).join(', ');
+    }
+    const color = it.action === 'delete' || it.action === 'reopen' ? 'var(--danger)' : it.action === 'create' || it.action === 'close' ? 'var(--paid)' : 'var(--accent)';
+    const icon = { create: '+', update: '✎', delete: '×', close: '✓', reopen: '↺', settings: '⚙' }[it.action] || '•';
+    return { title, sub, icon, color };
+  }
+
+  async function adminLoad(what) {
+    if (A.busy) return;
+    A.busy = true;
+    A.error = '';
+    try {
+      if (what !== 'log') A.overview = await adminApi('GET', '/api/admin/overview');
+      if (what !== 'overview') {
+        const q = `?type=${A.logType}&device=${encodeURIComponent(A.logDevice)}&limit=100`;
+        A.log = await adminApi('GET', '/api/admin/log' + q);
+        A.log.offset = A.log.items.length;
+      }
+    } catch (e) { A.error = e.message; toast(e.message); } finally { A.busy = false; if (S.view === 'admin') render(); }
+  }
+
+  function viewAdmin() {
+    if (!A.pw) {
+      return `<div class="card" style="max-width:420px;margin:20px auto 0">
+        <h3 style="margin:0 0 4px">אזור ניהול</h3><div class="mini">כניסות, מכשירים ויומן שינויים</div>
+        <form id="al"><input class="in" type="password" id="apw" placeholder="סיסמת ניהול" style="margin-top:14px" autocomplete="off">
+        <button class="btn primary block" style="margin-top:12px">כניסה</button></form>
+        <button class="btn ghost block" style="margin-top:8px" onclick="App.go('settings')">חזרה</button></div>`;
+    }
+    const tabs = [['overview', 'סקירה'], ['log', 'יומן'], ['devices', 'מכשירים']];
+    const seg = `<div class="seg">${tabs.map(([k, t]) => `<button class="${A.tab === k ? 'on' : ''}" data-at="${k}">${t}</button>`).join('')}</div>`;
+    if (!A.overview) return seg + (A.error && !A.busy ? `<div class="empty">${esc(A.error)}<br><button class="btn ghost" style="margin-top:10px" data-retry>נסו שוב</button></div>` : '<div class="empty">טוען…</div>');
+    const body = A.tab === 'log' ? adminLogView() : A.tab === 'devices' ? adminDevicesView() : adminOverviewView();
+    return seg + `<div style="margin-top:14px">${body}</div>`;
+  }
+
+  function adminOverviewView() {
+    const t = A.overview.totals;
+    const days = [];
+    const byDay = {};
+    for (const d of A.overview.daily) byDay[d.day] = d;
+    for (let i = 29; i >= 0; i--) {
+      const d = new Date(Date.now() - i * 86400000);
+      const k = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+      days.push({ k, ...(byDay[k] || { opens: 0, devices: 0, failed: 0 }) });
+    }
+    const max = Math.max(1, ...days.map((d) => d.opens));
+    const bars = days.map((d) => `<div title="${C.fmtDate(d.k)}: ${d.opens} פתיחות, ${d.devices} מכשירים${d.failed ? ', ' + d.failed + ' כושלים' : ''}"
+        style="flex:1;display:flex;flex-direction:column;justify-content:flex-end;gap:1px;height:100%">
+        ${d.failed ? `<i style="display:block;height:4px;border-radius:2px;background:var(--danger)"></i>` : ''}
+        <i style="display:block;height:${(d.opens / max) * 100}%;min-height:${d.opens ? 3 : 0}px;border-radius:3px 3px 0 0;background:var(--accent)"></i></div>`).join('');
+    const recent = A.overview.devices.slice(0, 5).map(devRow).join('');
+    return `
+      <div class="hero">
+        <div class="card stat"><div class="lbl">פתיחות ב-24 שעות</div><div class="val">${N(t.opens24)}</div><div class="sub">${N(t.opens)} מאז ההתחלה</div></div>
+        <div class="card stat"><div class="lbl">מכשירים פעילים בשבוע</div><div class="val">${N(t.active7)}</div><div class="sub">${N(t.devices)} מכשירים בסך הכל</div></div>
+        <div class="card stat"><div class="lbl">שינויים בשבוע</div><div class="val">${N(t.changes7)}</div><div class="sub">${N(t.changes)} בסך הכל</div></div>
+        <div class="card stat ${t.failed7 ? 'open' : ''}"><div class="lbl">סיסמה שגויה בשבוע</div><div class="val" style="${t.failed7 ? 'color:var(--danger)' : ''}">${N(t.failed7)}</div><div class="sub">ניסיונות כושלים</div></div>
+      </div>
+      <h2>פתיחות ב-30 הימים האחרונים</h2>
+      <div class="card"><div style="display:flex;gap:2px;height:110px;align-items:stretch">${bars}</div>
+        <div class="mini" style="display:flex;justify-content:space-between;margin-top:6px"><span class="num">${C.fmtDate(days[0].k)}</span><span>היום</span></div></div>
+      <h2>נראו לאחרונה</h2>
+      <div class="list">${recent || '<div class="empty">אין עדיין כניסות</div>'}</div>
+      <h2>הגדרות ניהול</h2>
+      <div class="card stack">
+        <button class="btn ghost block" id="apch">שינוי סיסמת ניהול</button>
+        <button class="btn danger block" id="aout">יציאה מאזור הניהול</button>
+      </div>`;
+  }
+
+  function devRow(d) {
+    const p = parseUA(d.user_agent);
+    return `<div class="card wrow" data-dev="${esc(d.id)}" style="cursor:pointer">
+      <div class="avatar" style="${d.blocked ? 'background:var(--open-soft);color:var(--danger)' : ''}">${/iPhone|Android|iPad/.test(p.os) ? '📱' : '💻'}</div>
+      <div style="min-width:0"><div class="name">${esc(devName(d.id))}${isMe(d.id) ? ' <span class="tag">המכשיר הזה</span>' : ''}${d.blocked ? ' <span class="tag" style="color:var(--danger)">חסום</span>' : ''}</div>
+        <div class="meta">${d.label ? esc(p.text) + ' · ' : ''}${esc(d.last_city || '')}${d.last_city ? ' · ' : ''}${ago(d.last_seen)}</div></div>
+      <div class="end"><div class="big">${N(d.opens)}</div><div class="meta">${N(d.opens7)} השבוע${d.changes ? ' · ' + N(d.changes) + ' שינויים' : ''}</div></div>
+    </div>`;
+  }
+
+  function adminDevicesView() {
+    const ds = A.overview.devices;
+    return `<div class="mini" style="margin:0 4px 10px">כל דפדפן שנכנס לאפליקציה מקבל מזהה משלו. לחיצה על מכשיר: מתן שם, צפייה בפעילות שלו או חסימה.</div>
+      <div class="list">${ds.map(devRow).join('') || '<div class="empty">אין עדיין מכשירים</div>'}</div>`;
+  }
+
+  function adminLogView() {
+    const types = [['all', 'הכל'], ['visits', 'כניסות'], ['changes', 'שינויים'], ['failed', 'כושלים']];
+    const filt = `<div class="chips">${types.map(([k, t]) => `<button class="chip ${A.logType === k ? 'on' : ''}" data-lt="${k}">${t}</button>`).join('')}</div>
+      ${A.logDevice ? `<div class="chips" style="margin-top:8px"><button class="chip on" id="ldx">${esc(devName(A.logDevice))} ✕</button></div>` : ''}`;
+    if (!A.log) return filt + '<div class="empty">טוען…</div>';
+    let lastDay = '';
+    const rows = A.log.items.map((it, i) => {
+      const d = describe(it);
+      const day = toDate(it.ts).toLocaleDateString('he-IL', { weekday: 'long', day: 'numeric', month: 'numeric' });
+      const head = day !== lastDay ? `<div class="day">${day}</div>` : '';
+      lastDay = day;
+      const time = toDate(it.ts).toLocaleTimeString('he-IL', { hour: '2-digit', minute: '2-digit' });
+      return `${head}<div class="card shift" data-li="${i}" style="padding:11px 14px;margin-top:6px">
+        <div class="avatar" style="width:32px;height:32px;font-size:15px;background:none;border:1.5px solid ${d.color};color:${d.color}">${d.icon}</div>
+        <div style="min-width:0;flex:1"><div style="font-weight:500">${esc(d.title)}</div>
+          ${d.sub ? `<div class="note">${esc(d.sub)}</div>` : ''}
+          <div class="note">${esc(devName(it.device_id, it.user_agent))}${it.city ? ' · ' + esc(it.city) : ''}</div></div>
+        <div class="hrs"><div class="num">${time}</div></div></div>`;
+    }).join('');
+    return filt + (rows || '<div class="empty">אין רשומות</div>') +
+      (A.log.more ? `<button class="btn ghost block" id="lmore" style="margin-top:12px">טען עוד</button>` : '');
+  }
+
+  function logItemSheet(it) {
+    const d = describe(it);
+    let detail = '';
+    if (it.kind === 'change') {
+      const b = it.before_json ? JSON.parse(it.before_json) : null;
+      const a = it.after_json ? JSON.parse(it.after_json) : null;
+      const keys = Object.keys(FIELD).filter((k) => (a && k in a) || (b && k in b));
+      const rowsHtml = keys.map((k) => {
+        const bv = b ? fieldVal(k, b[k]) : null;
+        const av = a ? fieldVal(k, a[k]) : null;
+        const changed = b && a && bv !== av;
+        return `<tr><td class="muted">${FIELD[k]}</td>${b ? `<td style="${changed ? 'color:var(--danger);text-decoration:line-through' : ''}">${esc(bv)}</td>` : ''}${a ? `<td style="${changed ? 'color:var(--paid);font-weight:600' : ''}">${esc(av)}</td>` : ''}</tr>`;
+      }).join('');
+      detail = keys.length ? `<table class="t" style="margin-top:14px"><thead><tr><th></th>${b ? '<th>לפני</th>' : ''}${a ? '<th>אחרי</th>' : ''}</tr></thead><tbody>${rowsHtml}</tbody></table>` : '';
+    }
+    const dev = devMap()[it.device_id];
+    openSheet(`
+      <h3>${esc(d.title)}</h3>
+      ${d.sub ? `<div class="mini">${esc(d.sub)}</div>` : ''}
+      ${detail}
+      <div style="margin-top:14px">
+        <div class="kv"><span>זמן</span><span class="num">${toDate(it.ts).toLocaleString('he-IL')}</span></div>
+        <div class="kv"><span>מכשיר</span><span>${esc(devName(it.device_id, it.user_agent))}</span></div>
+        ${dev || it.user_agent ? `<div class="kv"><span>דפדפן</span><span>${esc(parseUA((dev && dev.user_agent) || it.user_agent).text)}</span></div>` : ''}
+        ${it.city || it.country ? `<div class="kv"><span>מיקום</span><span>${esc([it.city, it.country].filter(Boolean).join(', '))}</span></div>` : ''}
+        ${it.ip ? `<div class="kv"><span>IP</span><span class="num">${esc(it.ip)}</span></div>` : ''}
+      </div>
+      <div class="acts">${it.device_id && dev ? `<button class="btn ghost" id="sdev">המכשיר</button>` : ''}<button class="btn primary" onclick="App.close()">סגירה</button></div>`, (el) => {
+      const b = el.querySelector('#sdev');
+      if (b) b.onclick = () => deviceSheet(it.device_id);
+    });
+  }
+
+  function deviceSheet(id) {
+    const d = devMap()[id];
+    if (!d) return;
+    const p = parseUA(d.user_agent);
+    openSheet(`
+      <h3>${esc(devName(id))}</h3>
+      <div class="mini">${esc(p.text)}${isMe(id) ? ' · המכשיר שאתה משתמש בו עכשיו' : ''}</div>
+      <label class="f">שם למכשיר (רק אתה רואה)</label>
+      <input class="in" id="dl" placeholder="למשל: הטלפון של יחזקאל" value="${esc(d.label || '')}">
+      <div style="margin-top:14px">
+        <div class="kv"><span>נראה לראשונה</span><span class="num">${fmtTs(d.first_seen)}</span></div>
+        <div class="kv"><span>נראה לאחרונה</span><span>${ago(d.last_seen)}</span></div>
+        <div class="kv"><span>פתיחות</span><span class="num">${d.opens} (${d.opens7} השבוע)</span></div>
+        <div class="kv"><span>שינויים בנתונים</span><span class="num">${d.changes}</span></div>
+        ${d.last_city ? `<div class="kv"><span>מיקום אחרון</span><span>${esc(d.last_city)}</span></div>` : ''}
+        ${d.last_ip ? `<div class="kv"><span>IP אחרון</span><span class="num">${esc(d.last_ip)}</span></div>` : ''}
+      </div>
+      ${isMe(id) ? '' : `<label class="check" style="margin-top:10px"><input type="checkbox" id="db" ${d.blocked ? 'checked' : ''}><span class="grow">חסימת המכשיר<div class="mini">חסימה מלאה של מישהו: להחליף את הסיסמה המשותפת</div></span></label>`}
+      <div class="acts"><button class="btn ghost" id="dlog">הפעילות שלו</button><button class="btn primary" id="dsv">שמירה</button></div>`, (el) => {
+      el.querySelector('#dsv').onclick = async () => {
+        try {
+          const bl = el.querySelector('#db');
+          A.overview = await adminApi('PUT', '/api/admin/devices/' + encodeURIComponent(id), { label: el.querySelector('#dl').value, blocked: bl ? bl.checked : false });
+          closeSheet(); render(); toast('נשמר');
+        } catch (e) { toast(e.message); }
+      };
+      el.querySelector('#dlog').onclick = () => { closeSheet(); A.tab = 'log'; A.logDevice = id; A.log = null; render(); adminLoad('log'); };
+    });
+  }
+
+  function passwordSheet() {
+    openSheet(`<h3>שינוי סיסמת ניהול</h3>
+      <label class="f">סיסמה חדשה (לפחות 6 תווים)</label><input class="in" type="password" id="np" autocomplete="new-password">
+      <div class="acts"><button class="btn ghost" onclick="App.close()">ביטול</button><button class="btn primary" id="nps">שמירה</button></div>`, (el) => {
+      el.querySelector('#nps').onclick = async () => {
+        const pw = el.querySelector('#np').value;
+        try {
+          await adminApi('PUT', '/api/admin/password', { password: pw });
+          A.pw = pw; LS.set('shifts.admin', pw); closeSheet(); toast('הסיסמה עודכנה');
+        } catch (e) { toast(e.message); }
+      };
+    });
+  }
+
+  function bindAdmin() {
+    const q = (sel) => $app.querySelector(sel);
+    const f = q('#al');
+    if (f) {
+      f.onsubmit = async (e) => {
+        e.preventDefault();
+        A.pw = q('#apw').value;
+        try {
+          await adminApi('POST', '/api/admin/login');
+          LS.set('shifts.admin', A.pw);
+          render(); adminLoad();
+        } catch (err) { toast(err.message); }
+      };
+      return;
+    }
+    const rt = q('[data-retry]'); if (rt) rt.onclick = () => adminLoad();
+    if (!A.overview && !A.busy && !A.error) { adminLoad(); return; }
+    $app.querySelectorAll('[data-at]').forEach((b) => b.onclick = () => {
+      A.tab = b.dataset.at; render();
+      if (A.tab === 'log' && !A.log) adminLoad('log');
+    });
+    $app.querySelectorAll('[data-dev]').forEach((b) => b.onclick = () => deviceSheet(b.dataset.dev));
+    $app.querySelectorAll('[data-lt]').forEach((b) => b.onclick = () => { A.logType = b.dataset.lt; A.log = null; render(); adminLoad('log'); });
+    $app.querySelectorAll('[data-li]').forEach((b) => b.onclick = () => logItemSheet(A.log.items[Number(b.dataset.li)]));
+    const x = q('#ldx'); if (x) x.onclick = () => { A.logDevice = ''; A.log = null; render(); adminLoad('log'); };
+    const more = q('#lmore');
+    if (more) more.onclick = async () => {
+      more.disabled = true;
+      try {
+        const r = await adminApi('GET', `/api/admin/log?type=${A.logType}&device=${encodeURIComponent(A.logDevice)}&limit=100&offset=${A.log.offset}`);
+        A.log.items = A.log.items.concat(r.items); A.log.more = r.more; A.log.offset += r.items.length; render();
+      } catch (e) { toast(e.message); more.disabled = false; }
+    };
+    const ch = q('#apch'); if (ch) ch.onclick = passwordSheet;
+    const out = q('#aout'); if (out) out.onclick = () => { A.pw = ''; LS.del('shifts.admin'); A.overview = null; A.log = null; App.go('settings'); };
+    if (A.tab === 'log' && !A.log && !A.busy && !A.error) adminLoad('log');
+  }
+
   // ---------- public handlers ----------
   window.App = {
     go(v) { S.view = v; LS.set('shifts.view', v); render(); window.scrollTo(0, 0); },
-    reload() { load(); },
+    reload() { if (S.view === 'admin' && A.pw) { A.error = ''; adminLoad(); } else load(); },
     newShift() { shiftForm(null); },
     editShift(id) { shiftForm(S.data.shifts.find((s) => s.id === id)); },
     fs(v) { S.filterStatus = v; render(); },
@@ -578,5 +932,5 @@
   document.addEventListener('visibilitychange', () => { if (!document.hidden && S.pass && S.data && !document.querySelector('.sheet-bg')) load(); });
 
   render();
-  if (S.pass) load();
+  if (S.pass) load(true);
 })();
