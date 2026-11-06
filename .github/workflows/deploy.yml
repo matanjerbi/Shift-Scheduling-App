@@ -82,6 +82,11 @@ jobs:
       - uses: actions/checkout@v4
       - name: Point the site at the API
         run: echo "window.API_URL = \"${{ needs.api.outputs.url }}\";" > web/config.js
+      - name: Cache-bust scripts so phones get the new version right away
+        run: |
+          v=$(echo $GITHUB_SHA | cut -c1-8)
+          sed -i -E "s#src=\"(config|calc|app)\.js\"#src=\"\1.js?v=$v\"#g" web/index.html
+          grep -o 'src="[^"]*"' web/index.html
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:
