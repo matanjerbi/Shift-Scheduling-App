@@ -215,6 +215,7 @@
     }
 
     return `
+      ${installBanner()}
       <div class="hero">
         <div class="card stat open"><div class="lbl">ממתין לתשלום</div><div class="val">${N(C.fmtHM(openMin))}</div><div class="sub">${N(C.fmtDec(openMin))} שעות · ${N(open.length)} משמרות</div><div class="sub">≈ ${N(C.fmtMoney(owed, 0))} לפי תעריף</div></div>
         <div class="card stat paid"><div class="lbl">שולם עד היום</div><div class="val">${N(C.fmtHM(paidMin))}</div><div class="sub">${N(C.fmtDec(paidMin))} שעות</div><div class="sub">${N(S.data.periods.length)} תשלומים</div></div>
@@ -531,6 +532,7 @@
   // ---------- Settings ----------
   function viewSettings() {
     return `
+      ${installCard()}
       <h2>תעריף ברירת מחדל</h2>
       <div class="card"><div class="row"><input class="in" id="dr" inputmode="decimal" value="${S.data.settings.default_rate}"><button class="btn primary" style="flex:none" onclick="App.saveRate()">שמירה</button></div>
         <div class="mini" style="margin-top:8px">לשעה, בשקלים. עובד עם תעריף משלו יחושב לפי התעריף שלו.</div></div>
@@ -911,6 +913,59 @@
     if (A.tab === 'log' && !A.log && !A.busy && !A.error) adminLoad('log');
   }
 
+  // ---------- Install as app ----------
+  const INS = { evt: null, hideBanner: LS.get('shifts.installHidden', false) };
+  const isStandalone = () => window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone === true;
+  const isIOS = () => /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  const isMobile = () => /Android|iPhone|iPad|iPod/.test(navigator.userAgent) || isIOS();
+
+  window.addEventListener('beforeinstallprompt', (e) => { e.preventDefault(); INS.evt = e; render(); });
+  window.addEventListener('appinstalled', () => { INS.evt = null; toast('האפליקציה הותקנה ✓'); render(); });
+  if ('serviceWorker' in navigator) window.addEventListener('load', () => navigator.serviceWorker.register('sw.js').catch(() => {}));
+
+  function installBanner() {
+    if (isStandalone() || INS.hideBanner || !(INS.evt || (isIOS() && isMobile()))) return '';
+    return `<div class="install"><img src="icon-192.png" alt="">
+      <div class="t"><b>התקינו את משמרות</b><span>פתיחה מהירה ממסך הבית, בלי דפדפן</span></div>
+      <button class="btn primary sm" onclick="App.install()">התקנה</button>
+      <button class="x" aria-label="סגירה" onclick="App.hideInstall()">×</button></div>`;
+  }
+
+  function installCard() {
+    if (isStandalone()) return `<div class="card wrow"><img src="icon-192.png" width="40" height="40" style="border-radius:10px" alt=""><div><div class="name">האפליקציה מותקנת ✓</div><div class="meta">אתם משתמשים בגרסה המותקנת</div></div></div>`;
+    return `<div class="card"><div class="wrow"><img src="icon-192.png" width="40" height="40" style="border-radius:10px" alt="">
+      <div><div class="name">התקנה כאפליקציה</div><div class="meta">אייקון במסך הבית, נפתח במסך מלא</div></div></div>
+      <button class="btn primary block" style="margin-top:12px" onclick="App.install()">התקנה למכשיר</button></div>`;
+  }
+
+  async function doInstall() {
+    if (INS.evt) {
+      const e = INS.evt;
+      INS.evt = null;
+      e.prompt();
+      try { await e.userChoice; } catch {}
+      render();
+      return;
+    }
+    // No one-tap install available: show the manual steps for this device
+    let title, steps;
+    if (isIOS()) {
+      const safari = !/CriOS|FxiOS|EdgiOS/.test(navigator.userAgent);
+      title = 'התקנה באייפון';
+      steps = (safari ? [] : ['פתחו את האתר ב-<b>Safari</b> (באייפון רק Safari יכול להתקין)'])
+        .concat(['לחצו על כפתור השיתוף <b>⬆︎</b> בתחתית המסך', 'גללו ובחרו <b>"הוספה למסך הבית"</b>', 'לחצו <b>"הוסף"</b> למעלה. האייקון יופיע במסך הבית']);
+    } else if (/Android/.test(navigator.userAgent)) {
+      title = 'התקנה באנדרואיד';
+      steps = ['לחצו על <b>⋮</b> בפינה העליונה של הדפדפן', 'בחרו <b>"התקנת אפליקציה"</b> או <b>"הוספה למסך הבית"</b>', 'אשרו. האייקון יופיע במסך הבית'];
+    } else {
+      title = 'התקנה במחשב';
+      steps = ['בכרום או אדג׳: לחצו על אייקון ההתקנה <b>⊕</b> בצד שורת הכתובת', 'או: תפריט <b>⋮</b> ← "שמירה ושיתוף" ← <b>"התקנת הדף כאפליקציה"</b>', 'האפליקציה תיפתח בחלון משלה ותופיע בתפריט התוכניות'];
+    }
+    openSheet(`<h3>${title}</h3><div class="mini">שלושה צעדים קצרים, פעם אחת</div>
+      <ol class="steps">${steps.map((t) => `<li><span>${t}</span></li>`).join('')}</ol>
+      <div class="acts"><button class="btn primary" onclick="App.close()">הבנתי</button></div>`);
+  }
+
   // ---------- public handlers ----------
   window.App = {
     go(v) { S.view = v; LS.set('shifts.view', v); render(); window.scrollTo(0, 0); },
@@ -925,6 +980,8 @@
     close: closeSheet,
     saveRate() { act('PUT', '/api/settings', { default_rate: document.getElementById('dr').value }, 'התעריף נשמר'); },
     csv: exportCsv,
+    install: doInstall,
+    hideInstall() { INS.hideBanner = true; LS.set('shifts.installHidden', true); render(); },
     logout() { if (confirm('להתנתק?')) { LS.del('shifts.pass'); S.pass = ''; S.data = null; render(); } },
   };
 
