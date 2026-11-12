@@ -393,8 +393,9 @@
       <div class="mini">המשמרות שיסומנו יעברו ל"שולם". משמרות חדשות ייכנסו לתקופה הבאה.</div>
       <label class="f">שם התקופה</label>
       <input class="in" id="pn" value="${esc(defName)}">
-      <label class="f">סכום שהתקבל בפועל (לא חובה)</label>
+      <label class="f">סכום לתשלום</label>
       <input class="in" id="pa" inputmode="decimal" placeholder="למשל 13200">
+      <div class="mini" id="exp" style="margin-top:6px"></div>
       <div class="preview"><div><small>תעריף אפקטיבי לשעה</small><div><b id="eff" class="num">—</b></div></div><div class="mini" id="hrs"></div></div>
       <label class="f">משמרות בתקופה</label>
       <div class="chips" style="margin-bottom:6px"><button type="button" class="chip" id="all">סמן הכל</button><button type="button" class="chip" id="none">נקה</button>
@@ -405,18 +406,29 @@
       const q = (id) => el.querySelector('#' + id);
       const boxes = () => [...el.querySelectorAll('#cl input')];
       const sel = () => boxes().filter((b) => b.checked).map((b) => Number(b.dataset.id));
+      // The amount starts as what the rates say is owed; once typed over, it stays as typed
+      let touched = false;
+      const expectedFor = (list) => Math.round(list.reduce((a, s) => a + (C.shiftMinutes(s) / 60) * rateOf(workerById(s.worker_id)), 0) * 100) / 100;
+      const fmtIn = (n) => (Math.abs(n - Math.round(n)) < 0.005 ? String(Math.round(n)) : n.toFixed(2));
       const upd = () => {
         const ids = sel();
         const list = open.filter((s) => ids.includes(s.id));
         const min = sumMin(list);
+        const exp = expectedFor(list);
+        if (!touched) q('pa').value = exp ? fmtIn(exp) : '';
         const amt = parseFloat(String(q('pa').value).replace(/,/g, ''));
+        const diff = touched && amt > 0 && Math.abs(amt - exp) >= 0.01;
+        q('exp').innerHTML = !list.length ? '' : !touched
+          ? `מחושב לפי התעריף (${N(C.fmtMoney(S.data.settings.default_rate))} לשעה). אפשר לשנות לסכום שהתקבל בפועל.`
+          : `לפי התעריף היה יוצא ${N(C.fmtMoney(exp, 2))}${diff ? ` · הפרש ${N(C.fmtMoney(amt - exp, 2))}` : ''} · <a href="#" id="rst" style="color:var(--accent)">חזרה לחישוב</a>`;
+        const r = q('rst'); if (r) r.onclick = (e) => { e.preventDefault(); touched = false; upd(); };
         q('hrs').innerHTML = `${N(ids.length)} משמרות · ${N(C.fmtDec(min))} שעות`;
         q('eff').textContent = amt > 0 && min ? C.fmtMoney(amt / (min / 60), 2) : '—';
         q('split').innerHTML = list.length ? splitTable(list, amt > 0 ? amt : 0) : '';
         q('ok').textContent = `סגירה ושמירה (${ids.length})`;
       };
       el.querySelectorAll('#cl input').forEach((b) => b.onchange = upd);
-      q('pa').oninput = upd;
+      q('pa').oninput = () => { touched = true; upd(); };
       q('all').onclick = () => { boxes().forEach((b) => b.checked = true); upd(); };
       q('none').onclick = () => { boxes().forEach((b) => b.checked = false); upd(); };
       el.querySelectorAll('[data-w]').forEach((c) => c.onclick = () => {
