@@ -434,19 +434,41 @@
     });
   }
 
-  function periodSheet(id) {
+  function periodSheet(id, editing) {
     const p = S.data.periods.find((x) => x.id === id);
     if (!p) return;
-    const { list, min } = periodSummary(p);
-    openSheet(`
-      <h3>${esc(p.name)}</h3>
-      <div class="mini">נסגר ב-${N(C.fmtDate((p.closed_at || '').slice(0, 10)))} · ${N(list.length)} משמרות</div>
+    const { list, min, eff } = periodSummary(p);
+    const head = `<div class="sh-head"><div><h3>${esc(p.name)}</h3>
+      <div class="mini">נסגר ב-${N(C.fmtDate((p.closed_at || '').slice(0, 10)))} · ${N(list.length)} משמרות</div></div>
+      <button class="xbtn" aria-label="סגירה" onclick="App.close()">×</button></div>`;
+
+    if (!editing) {
+      // View only: nothing can be changed from here until "עריכה" is pressed
+      const shiftsHtml = list.slice().sort((a, b) => (a.date < b.date ? -1 : 1)).map((s) =>
+        `<div class="kv"><span>${esc(wName(s.worker_id))} · ${C.dayName(s.date)} ${N(C.fmtDate(s.date))}</span><span class="num">${C.fmtHM(C.shiftMinutes(s))}</span></div>`).join('');
+      openSheet(`${head}
+        <div class="hero" style="margin-top:14px">
+          <div class="card stat"><div class="lbl">סכום שהתקבל</div><div class="val" style="font-size:22px">${N(C.fmtMoney(p.amount_received))}</div><div class="sub">${N(C.fmtDec(min))} שעות</div></div>
+          <div class="card stat"><div class="lbl">תעריף אפקטיבי</div><div class="val" style="font-size:22px">${eff ? N(C.fmtMoney(eff, 2)) : '—'}</div><div class="sub">לשעה</div></div>
+        </div>
+        ${p.note ? `<div class="mini" style="margin-top:12px">הערה: ${esc(p.note)}</div>` : ''}
+        <h2 style="margin:18px 0 6px">חלוקה לפי עובד</h2>
+        ${splitTable(list, p.amount_received > 0 ? p.amount_received : 0)}
+        <details style="margin-top:14px"><summary class="muted small" style="cursor:pointer">המשמרות בתקופה (${list.length})</summary><div style="margin-top:6px">${shiftsHtml}</div></details>
+        <div class="acts"><button class="btn ghost" id="ed">✎ עריכה</button></div>`, (el) => {
+        el.querySelector('#ed').onclick = () => periodSheet(id, true);
+      });
+      return;
+    }
+
+    openSheet(`${head}
       <label class="f">שם</label><input class="in" id="pn" value="${esc(p.name)}">
       <label class="f">סכום שהתקבל</label><input class="in" id="pa" inputmode="decimal" value="${p.amount_received ?? ''}" placeholder="לא הוזן">
       <label class="f">הערה</label><input class="in" id="pt" value="${esc(p.note || '')}">
       <div class="preview"><div><small>תעריף אפקטיבי לשעה</small><div><b id="eff" class="num">—</b></div></div><div class="mini">${N(C.fmtDec(min))} שעות</div></div>
       <div id="split" style="margin-top:14px"></div>
-      <div class="acts"><button class="btn danger" id="re">פתיחה מחדש</button><button class="btn primary" id="sv">שמירה</button></div>`, (el) => {
+      <div class="acts"><button class="btn ghost" id="cx">ביטול</button><button class="btn primary" id="sv">שמירה</button></div>
+      <button class="btn danger block" id="re" style="margin-top:10px">פתיחה מחדש של התקופה</button>`, (el) => {
       const q = (i) => el.querySelector('#' + i);
       const upd = () => {
         const amt = parseFloat(String(q('pa').value).replace(/,/g, ''));
@@ -454,9 +476,10 @@
         q('split').innerHTML = splitTable(list, amt > 0 ? amt : 0);
       };
       q('pa').oninput = upd; upd();
-      q('sv').onclick = () => {
+      q('cx').onclick = () => periodSheet(id, false);
+      q('sv').onclick = async () => {
         const amt = parseFloat(String(q('pa').value).replace(/,/g, ''));
-        act('PUT', '/api/periods/' + id, { name: q('pn').value, amount_received: amt > 0 ? amt : null, note: q('pt').value }, 'נשמר');
+        if (await act('PUT', '/api/periods/' + id, { name: q('pn').value, amount_received: amt > 0 ? amt : null, note: q('pt').value }, 'נשמר')) periodSheet(id, false);
       };
       q('re').onclick = () => { if (confirm('לפתוח מחדש? המשמרות יחזרו ל"ממתין לתשלום".')) act('DELETE', '/api/periods/' + id, null, 'התקופה נפתחה מחדש'); };
     });
