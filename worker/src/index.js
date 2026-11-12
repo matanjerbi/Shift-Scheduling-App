@@ -202,7 +202,7 @@ async function adminLog(db, url) {
     if (dev) { w += ' AND device_id = ?'; binds.push(dev); }
     parts.push(
       `SELECT 'visit' AS kind, id, ts, device_id, ip, event AS action, NULL AS entity, NULL AS entity_id,
-         NULL AS before_json, NULL AS after_json, city, country, user_agent FROM visits WHERE ${w}`
+         NULL AS before_json, NULL AS after_json, city, country, user_agent, NULL AS undone_at, NULL AS undo_of FROM visits WHERE ${w}`
     );
   }
   if (type === 'all' || type === 'changes') {
@@ -210,13 +210,125 @@ async function adminLog(db, url) {
     if (dev) { w += ' AND device_id = ?'; binds.push(dev); }
     parts.push(
       `SELECT 'change' AS kind, id, ts, device_id, ip, action, entity, entity_id, before_json, after_json,
-         NULL AS city, NULL AS country, NULL AS user_agent FROM audit WHERE ${w}`
+         NULL AS city, NULL AS country, NULL AS user_agent, undone_at, undo_of FROM audit WHERE ${w}`
     );
   }
   const sql = parts.join(' UNION ALL ') + ' ORDER BY ts DESC, id DESC LIMIT ? OFFSET ?';
   const r = await db.prepare(sql).bind(...binds, limit + 1, offset).all();
   const items = r.results.slice(0, limit);
   return { items, more: r.results.length > limit };
+}
+
+// ---------- undo ----------
+const COLS = {
+  shifts: ['date', 'worker_id', 'start_time', 'end_time', 'extra_minutes', 'hours_override', 'note', 'period_id', 'created_at', 'updated_at'],
+  workers: ['name', 'rate', 'active', 'created_at'],
+  periods: ['name', 'amount_received', 'note', 'closed_at'],
+};
+const TABLE = { shift: 'shifts', worker: 'workers', period: 'periods' };
+// period_id is payment status — it is changed by closing/reopening periods, which have their own undo
+const IGNORE = new Set(['created_at', 'updated_at', 'shift_ids', 'period_id']);
+
+// Same content? (timestamps ignored)
+function sameRow(a, b) {
+  if (!a || !b) return false;
+  const keys = new Set([...Object.keys(a), ...Object.keys(b)].filter((k) => !IGNORE.has(k)));
+  for (const k of keys) if (String(a[k] ?? '') !== String(b[k] ?? '')) return false;
+  return true;
+}
+
+// Write `obj` back as row `id`: update it if it exists, otherwise re-create it with the same id
+function restoreStmts(db, table, id, obj, exists) {
+  const cols = COLS[table].filter((c) => c in obj);
+  if (exists) {
+    return [db.prepare(`UPDATE ${table} SET ${cols.map((c) => c + ' = ?').join(', ')} WHERE id = ?`).bind(...cols.map((c) => obj[c] ?? null), id)];
+  }
+  return [db.prepare(`INSERT INTO ${table} (id, ${cols.join(', ')}) VALUES (?, ${cols.map(() => '?').join(', ')})`).bind(id, ...cols.map((c) => obj[c] ?? null))];
+}
+
+async function undoEntry(db, ctx, auditId, force) {
+  const e = await db.prepare('SELECT * FROM audit WHERE id = ?').bind(auditId).first();
+  if (!e) return { error: 'הרשומה לא נמצאה', status: 404 };
+  if (e.undone_at) return { error: 'הפעולה הזו כבר בוטלה', status: 409 };
+  if (e.action === 'undo') return { error: 'אי אפשר לבטל ביטול. אפשר לערוך ידנית באפליקציה', status: 400 };
+  const before = e.before_json ? JSON.parse(e.before_json) : null;
+  const after = e.after_json ? JSON.parse(e.after_json) : null;
+  const conflict = (msg) => ({ error: msg, conflict: true, status: 409 });
+  let stmts = [];
+  let snapBefore = null;
+  let snapAfter = null;
+
+  if (e.entity === 'settings') {
+    if (!before || before.default_rate === undefined) return { error: 'אין מה לבטל כאן', status: 400 };
+    const cur = await db.prepare("SELECT value FROM settings WHERE key = 'default_rate'").first();
+    if (!force && after && String(Number(cur && cur.value)) !== String(after.default_rate))
+      return conflict('התעריף שונה שוב מאז הפעולה הזו. לבטל בכל זאת?');
+    stmts.push(db.prepare("INSERT INTO settings (key, value) VALUES ('default_rate', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").bind(String(before.default_rate)));
+    snapBefore = { default_rate: Number(cur && cur.value) };
+    snapAfter = { default_rate: before.default_rate };
+  } else if (e.entity === 'period' && (e.action === 'close' || e.action === 'reopen')) {
+    const id = e.entity_id;
+    const cur = await row(db, 'periods', id);
+    if (e.action === 'close') {
+      // Undo "closed as paid": reopen it
+      if (!cur) return conflict('התקופה כבר נפתחה מחדש או נמחקה');
+      const ids = (await db.prepare('SELECT id FROM shifts WHERE period_id = ?').bind(id).all()).results.map((r) => r.id);
+      stmts.push(db.prepare('UPDATE shifts SET period_id = NULL WHERE period_id = ?').bind(id));
+      stmts.push(db.prepare('DELETE FROM periods WHERE id = ?').bind(id));
+      snapBefore = { ...cur, shift_ids: ids };
+    } else {
+      // Undo "reopen": close it again with the same shifts
+      if (cur) return conflict('התקופה כבר קיימת שוב');
+      const p = { ...before };
+      delete p.shift_ids;
+      stmts.push(...restoreStmts(db, 'periods', id, p, false));
+      const ids = (before.shift_ids || []).map(Number).filter((n) => n > 0);
+      for (const sid of ids) stmts.push(db.prepare('UPDATE shifts SET period_id = ? WHERE id = ? AND period_id IS NULL').bind(id, sid));
+      snapAfter = before;
+    }
+  } else if (TABLE[e.entity]) {
+    const table = TABLE[e.entity];
+    const id = e.entity_id;
+    const cur = await row(db, table, id);
+    snapBefore = cur;
+    if (e.action === 'create') {
+      if (!cur) return conflict('הפריט כבר נמחק');
+      if (!force && !sameRow(cur, after)) return conflict('מישהו ערך את זה אחרי הפעולה. למחוק בכל זאת?');
+      if (table === 'workers') {
+        const used = await db.prepare('SELECT COUNT(*) n FROM shifts WHERE worker_id = ?').bind(id).first();
+        if (used.n) return { error: `לעובד יש ${used.n} משמרות. אפשר לסמן אותו כלא פעיל בהגדרות`, status: 400 };
+      }
+      stmts.push(db.prepare(`DELETE FROM ${table} WHERE id = ?`).bind(id));
+    } else if (e.action === 'update' || e.action === 'delete') {
+      if (e.action === 'update' && !force) {
+        if (!cur) return conflict('הפריט נמחק מאז. להחזיר אותו כמו שהיה?');
+        if (!sameRow(cur, after)) return conflict('מישהו ערך את זה שוב אחרי הפעולה. להחזיר בכל זאת?');
+      }
+      if (e.action === 'delete' && cur && !force) return conflict('קיים כבר פריט עם אותו מזהה. לדרוס אותו?');
+      const obj = { ...before };
+      if (table === 'shifts' && cur) obj.period_id = cur.period_id; // keep current paid/unpaid status
+      if (table === 'shifts' && obj.period_id) {
+        const p = await row(db, 'periods', obj.period_id);
+        if (!p) obj.period_id = null; // that payment no longer exists
+      }
+      if (table === 'shifts') {
+        const w = await row(db, 'workers', obj.worker_id);
+        if (!w) return { error: 'העובד של המשמרת כבר לא קיים', status: 400 };
+      }
+      stmts.push(...restoreStmts(db, table, id, obj, !!cur));
+      snapAfter = obj;
+    } else return { error: 'אי אפשר לבטל פעולה כזו', status: 400 };
+  } else {
+    return { error: 'אי אפשר לבטל פעולה כזו', status: 400 };
+  }
+
+  stmts.push(db.prepare("UPDATE audit SET undone_at = datetime('now') WHERE id = ?").bind(auditId));
+  stmts.push(
+    db.prepare('INSERT INTO audit (device_id, ip, action, entity, entity_id, before_json, after_json, undo_of) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+      .bind(ctx.device, ctx.ip, 'undo', e.entity, e.entity_id, snapBefore ? JSON.stringify(snapBefore) : null, snapAfter ? JSON.stringify(snapAfter) : null, auditId)
+  );
+  await db.batch(stmts);
+  return { ok: true };
 }
 
 async function handleAdmin(req, env, ctx, path, m, url) {
@@ -240,6 +352,13 @@ async function handleAdmin(req, env, ctx, path, m, url) {
       .bind(label, b.blocked ? 1 : 0, mm[1])
       .run();
     return json(await adminOverview(db));
+  }
+  mm = path.match(/^\/api\/admin\/undo\/(\d+)$/);
+  if (mm && m === 'POST') {
+    const b = await readBody(req);
+    const r = await undoEntry(db, ctx, Number(mm[1]), !!b.force);
+    if (r.error) return json(r, r.status || 400);
+    return json(r);
   }
   if (path === '/api/admin/password' && m === 'PUT') {
     const b = await readBody(req);

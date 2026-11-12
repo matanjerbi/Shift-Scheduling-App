@@ -659,7 +659,7 @@
     const t = s.hours_override !== null && s.hours_override !== undefined ? 'סך ידני' : `${s.start_time}–${s.end_time}`;
     return `${wName(s.worker_id)} · ${C.dayName(s.date)} ${C.fmtDate(s.date)} · ${t} (${C.fmtHM(C.shiftMinutes(s))})`;
   }
-  const VERB = { create: 'הוסיף', update: 'עדכן', delete: 'מחק', close: 'סגר', reopen: 'פתח מחדש', settings: 'שינה' };
+  const VERB = { create: 'הוסיף', update: 'עדכן', delete: 'מחק', close: 'סגר', reopen: 'פתח מחדש', settings: 'שינה', undo: 'ביטל פעולה על' };
   const NOUN = { shift: 'משמרת', worker: 'עובד', period: 'תקופת תשלום', settings: 'הגדרות', admin_password: 'סיסמת ניהול' };
 
   function describe(it) {
@@ -683,7 +683,7 @@
       const p = a || b || {};
       sub = `${p.name || ''}${p.amount_received ? ' · ' + C.fmtMoney(p.amount_received) : ''}${p.shift_ids ? ' · ' + p.shift_ids.length + ' משמרות' : ''}`;
     } else if (it.entity === 'settings' && a && b) {
-      title = 'עדכן תעריף ברירת מחדל';
+      title = it.action === 'undo' ? 'ביטל שינוי תעריף' : 'עדכן תעריף ברירת מחדל';
       sub = `${C.fmtMoney(b.default_rate)} ← ${C.fmtMoney(a.default_rate)}`;
     }
     if (it.action === 'update' && b && a && it.entity !== 'settings') {
@@ -691,7 +691,7 @@
       if (ch.length) sub += (sub ? ' · ' : '') + 'שונה: ' + ch.map((k) => FIELD[k]).join(', ');
     }
     const color = it.action === 'delete' || it.action === 'reopen' ? 'var(--danger)' : it.action === 'create' || it.action === 'close' ? 'var(--paid)' : 'var(--accent)';
-    const icon = { create: '+', update: '✎', delete: '×', close: '✓', reopen: '↺', settings: '⚙' }[it.action] || '•';
+    const icon = { create: '+', update: '✎', delete: '×', close: '✓', reopen: '↺', settings: '⚙', undo: '↶' }[it.action] || '•';
     return { title, sub, icon, color };
   }
 
@@ -787,15 +787,56 @@
       const head = day !== lastDay ? `<div class="day">${day}</div>` : '';
       lastDay = day;
       const time = toDate(it.ts).toLocaleTimeString('he-IL', { hour: '2-digit', minute: '2-digit' });
-      return `${head}<div class="card shift" data-li="${i}" style="padding:11px 14px;margin-top:6px">
+      return `${head}<div class="card shift" data-li="${i}" style="padding:11px 14px;margin-top:6px;${it.undone_at ? 'opacity:.55' : ''}">
         <div class="avatar" style="width:32px;height:32px;font-size:15px;background:none;border:1.5px solid ${d.color};color:${d.color}">${d.icon}</div>
-        <div style="min-width:0;flex:1"><div style="font-weight:500">${esc(d.title)}</div>
+        <div style="min-width:0;flex:1"><div style="font-weight:500">${esc(d.title)}${it.undone_at ? ' <span class="tag">בוטל</span>' : ''}</div>
           ${d.sub ? `<div class="note">${esc(d.sub)}</div>` : ''}
           <div class="note">${esc(devName(it.device_id, it.user_agent))}${it.city ? ' · ' + esc(it.city) : ''}</div></div>
         <div class="hrs"><div class="num">${time}</div></div></div>`;
     }).join('');
     return filt + (rows || '<div class="empty">אין רשומות</div>') +
       (A.log.more ? `<button class="btn ghost block" id="lmore" style="margin-top:12px">טען עוד</button>` : '');
+  }
+
+  function undoText(it) {
+    const b = it.before_json ? JSON.parse(it.before_json) : null;
+    if (it.entity === 'settings') return b ? `התעריף יחזור ל-${C.fmtMoney(b.default_rate)}` : '';
+    if (it.entity === 'period') return it.action === 'close' ? 'התקופה תיפתח מחדש והמשמרות שלה יחזרו ל"ממתין לתשלום"'
+      : it.action === 'reopen' ? 'התקופה תיסגר שוב עם אותו סכום ואותן משמרות' : 'שם, סכום והערה יחזרו למה שהיה לפני';
+    const noun = it.entity === 'worker' ? 'העובד' : 'המשמרת';
+    return it.action === 'create' ? `${noun} שנוספה תימחק` : it.action === 'delete' ? `${noun} תוחזר בדיוק כמו שהייתה` : 'כל הערכים יחזרו למה שהיה לפני';
+  }
+  function undoBlock(it) {
+    if (it.kind !== 'change') return '';
+    if (it.undone_at) return `<div class="preview" style="background:var(--line)"><div><small>הפעולה הזו בוטלה</small><div class="small num">${toDate(it.undone_at).toLocaleString('he-IL')}</div></div></div>`;
+    if (it.action === 'undo' || it.entity === 'admin_password') return '';
+    return `<div class="preview" style="background:var(--open-soft);display:block">
+      <small>ביטול הפעולה: ${esc(undoText(it))}</small>
+      <button class="btn block" id="undo" style="margin-top:10px;background:var(--danger);color:#fff">↶ ביטול הפעולה</button></div>`;
+  }
+  async function doUndo(it, btn, force) {
+    if (!force && !confirm('לבטל את הפעולה ולהחזיר את המצב לקדמותו?')) return;
+    btn.disabled = true;
+    try {
+      const res = await fetch(API + '/api/admin/undo/' + it.id, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-App-Password': S.pass, 'X-Device': S.device, 'X-Admin-Password': A.pw },
+        body: JSON.stringify({ force: !!force }),
+      });
+      let data = {};
+      try { data = await res.json(); } catch {}
+      if (res.status === 409 && data.conflict && !force) {
+        btn.disabled = false;
+        if (confirm(data.error)) return doUndo(it, btn, true);
+        return;
+      }
+      if (!res.ok) throw new Error(data.error || 'שגיאה ' + res.status);
+      closeSheet();
+      toast('הפעולה בוטלה ✓');
+      A.log = null;
+      try { await api('GET', '/api/state'); } catch {}
+      adminLoad();
+    } catch (e) { toast(e.message); btn.disabled = false; }
   }
 
   function logItemSheet(it) {
@@ -825,9 +866,12 @@
         ${it.city || it.country ? `<div class="kv"><span>מיקום</span><span>${esc([it.city, it.country].filter(Boolean).join(', '))}</span></div>` : ''}
         ${it.ip ? `<div class="kv"><span>IP</span><span class="num">${esc(it.ip)}</span></div>` : ''}
       </div>
+      ${undoBlock(it)}
       <div class="acts">${it.device_id && dev ? `<button class="btn ghost" id="sdev">המכשיר</button>` : ''}<button class="btn primary" onclick="App.close()">סגירה</button></div>`, (el) => {
       const b = el.querySelector('#sdev');
       if (b) b.onclick = () => deviceSheet(it.device_id);
+      const u = el.querySelector('#undo');
+      if (u) u.onclick = () => doUndo(it, u);
     });
   }
 
