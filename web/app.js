@@ -759,7 +759,7 @@
       <label class="f">עובד</label>
       <div class="chips" id="xw"><button type="button" class="chip ${XS.worker === 'all' ? 'on' : ''}" data-w="all">כולם</button>${workers().map((w) => `<button type="button" class="chip ${String(XS.worker) === String(w.id) ? 'on' : ''}" data-w="${w.id}">${esc(w.name)}</button>`).join('')}</div>
       <div class="preview" id="xsum"></div>
-      <div class="mini" style="margin-top:10px">בקובץ: גיליון משמרות עם סה״כ, סיכום לפי עובד, וחשבון התשלומים עם הפער המצטבר.</div>
+      <div class="mini" style="margin-top:10px">בקובץ: החשבון המלא בעמוד אחד (תשלומים, ממתין, פער ומה מגיע עכשיו), גיליון משמרות עם סה״כ, וסיכום לפי עובד.</div>
       <button class="btn primary block" id="xgo" style="margin-top:16px">⬇ הורדת קובץ אקסל</button>
       <button class="btn ghost block" id="xcsv" style="margin-top:8px">או CSV פשוט</button>`, (el) => {
       el.querySelectorAll('#xs [data-s]').forEach((b) => b.onclick = () => {
@@ -829,9 +829,15 @@
     let cum = 0;
     const payments = chron.map((p) => {
       const a = periodAccount(p);
-      if (a.gap !== null) cum = r2(cum + a.gap);
-      return { name: p.name, closed: p.closed_at ? C.fmtDate(p.closed_at.slice(0, 10)) : '', min: sumMin(a.list), expected: a.expected, carry: a.carrySum, received: a.received, gap: a.gap, cum };
-    });
+      const rows = Object.entries(a.rows).filter(([w]) => mine(w)).map(([, r]) => r);
+      const sum = (k) => r2(rows.reduce((x, r) => x + (r[k] || 0), 0));
+      const gap = a.received === null ? null : sum('gap');
+      if (gap !== null) cum = r2(cum + gap);
+      return { name: p.name, closed: p.closed_at ? C.fmtDate(p.closed_at.slice(0, 10)) : '', min: rows.reduce((x, r) => x + r.minutes, 0),
+        expected: sum('expected'), carry: sum('carry'), received: a.received === null ? null : sum('paid'), gap, cum };
+    }).filter((x) => x.min || x.carry || (x.received || 0));
+    // the open account: shifts not yet closed
+    payments.push({ name: 'ממתין לתשלום (טרם נסגר)', closed: '', min: sumMin(openL), expected: expectedOf(openL), carry: 0, received: null, gap: expectedOf(openL), cum: r2(cum + expectedOf(openL)), pending: true });
     return {
       who: wf === null ? 'כל העובדים' : wName(wf),
       allMin: sumMin(all), paidMin: sumMin(paidL), openMin: sumMin(openL), openN: openL.length, paidN: paidL.length,
@@ -862,17 +868,16 @@
     rows.push([st.prevGap >= 0 ? 'פער פתוח מחשבונות קודמים (חסר)' : 'עודף מחשבונות קודמים', '', '', f2(st.prevGap)]);
     rows.push(['סה״כ מגיע עכשיו (ממתין + פער)', '', '', f2(st.due)]);
     rows.push([]);
+    rows.push([`החשבון המלא — ${st.who}`]);
+    rows.push(['תקופה', 'נסגר', 'שעות', 'לפי תעריף (₪)', 'השלמת פער קודם (₪)', 'התקבל (₪)', 'פער (₪)', 'פער מצטבר (₪)']);
+    st.payments.forEach((p) => rows.push([p.name, p.pending ? 'פתוח' : p.closed, C.fmtDec(p.min), f2(p.expected), p.carry ? f2(p.carry) : '', p.pending ? '—' : p.received === null ? 'לא הוזן' : f2(p.received), f2(p.gap), f2(p.cum)]));
+    rows.push(['סה״כ מגיע עכשיו', '', '', '', '', '', '', f2(st.due)]);
+    rows.push([]);
     rows.push(['לפי עובד']);
     rows.push(['עובד', 'משמרות', 'שעות', 'ממתין (שעות)', 'ממתין לפי תעריף (₪)', 'שולם לפי תעריף (₪)', 'קיבל (₪)', 'פער מחשבונות קודמים (₪)', 'סה״כ מגיע עכשיו (₪)']);
     const pw = Object.entries(st.perW);
     pw.forEach(([w, r]) => rows.push([wName(w), r.n, C.fmtDec(r.min), C.fmtDec(r.openMin), f2(r.openExp), f2(r.paidExp), f2(r.recv), f2(r.gap), f2(r.due)]));
     rows.push(['סה״כ', pw.reduce((a, [, r]) => a + r.n, 0), C.fmtDec(st.allMin), C.fmtDec(st.openMin), f2(st.openExp), f2(st.paidExp), f2(st.recv), f2(st.prevGap), f2(st.due)]);
-    if (st.payments.length) {
-      rows.push([]);
-      rows.push(['חשבון תשלומים (כל הצוות)']);
-      rows.push(['תקופה', 'נסגר', 'שעות', 'לפי תעריף (₪)', 'השלמת פער קודם (₪)', 'התקבל (₪)', 'פער (₪)', 'פער מצטבר (₪)']);
-      st.payments.forEach((p) => rows.push([p.name, p.closed, C.fmtDec(p.min), f2(p.expected), p.carry ? f2(p.carry) : '', p.received === null ? 'לא הוזן' : f2(p.received), f2(p.gap), f2(p.cum)]));
-    }
     rows.push([]);
     rows.push(['פער = לפי תעריף פחות מה שהתקבל. חיובי = עוד מגיע כסף, שלילי = שולם יותר.']);
     rows.push([`הופק ${new Date().toLocaleString('he-IL')}`]);
@@ -972,57 +977,95 @@
     }
     const toDateCell = (d) => { const [y, m, dd] = d.split('-').map(Number); return new Date(Date.UTC(y, m - 1, dd)); };
 
-    // ----- Sheet 0: overall status -----
+    // ----- Sheet 0: the full account on one page -----
     {
       const st = statusSummary();
-      const w0 = wb.addWorksheet('מצב כללי', { properties: { tabColor: { argb: COL.open } } });
-      const c0 = [{ key: 'l', h: '', w: 34 }, { key: 'h', h: 'שעות', w: 12 }, { key: 'n', h: 'משמרות', w: 11 }, { key: 'v', h: 'סכום', w: 16 }];
-      header(w0, `מצב כללי — ${st.who}`, `כל ההיסטוריה · הופק ${stamp}`, c0);
-      const lines = [
-        ['שולם — לפי תעריף', st.paidMin / 1440, st.paidN, st.paidExp],
-        ['שולם — התקבל בפועל', '', '', st.recv],
-        ['ממתין לתשלום — לפי תעריף', st.openMin / 1440, st.openN, st.openExp],
-        [st.prevGap >= 0 ? 'פער פתוח מחשבונות קודמים (חסר)' : 'עודף מחשבונות קודמים', '', '', st.prevGap],
+      const w0 = wb.addWorksheet('החשבון המלא', { properties: { tabColor: { argb: COL.open } } });
+      const c0 = [
+        { key: 'name', h: 'תקופה', w: 30 }, { key: 'closed', h: 'נסגר', w: 12 }, { key: 'dec', h: 'שעות', w: 10 },
+        { key: 'exp', h: 'לפי תעריף', w: 15 }, { key: 'carry', h: 'השלמת פער קודם', w: 15 }, { key: 'recv', h: 'התקבל', w: 15 },
+        { key: 'gap', h: 'פער', w: 14 }, { key: 'cum', h: 'פער מצטבר', w: 15 },
       ];
-      lines.forEach((ln, i) => {
-        const row = w0.getRow(5 + i);
-        row.values = ln;
-        row.getCell(2).numFmt = HM; row.getCell(4).numFmt = MONEY;
-        row.getCell(1).alignment = { horizontal: 'right', vertical: 'middle', indent: 1 };
-      });
-      styleBody(w0, 5, 4 + lines.length, 4);
-      for (let i = 0; i < lines.length; i++) w0.getRow(5 + i).getCell(1).alignment = { horizontal: 'right', vertical: 'middle', indent: 1 };
-      w0.getRow(8).getCell(4).font = { name: FONT, bold: true, color: { argb: st.prevGap > 0 ? COL.open : COL.paid } };
-      const t = w0.getRow(5 + lines.length);
-      t.getCell(1).value = 'סה״כ מגיע עכשיו (ממתין + פער)';
-      t.getCell(4).value = { formula: 'D7+D8', result: st.due };
-      totalRow(w0, 5 + lines.length, 4);
+      header(w0, `החשבון המלא — ${st.who}`, `כל ההיסטוריה: תשלומים שנסגרו + מה שממתין · הופק ${stamp}`, c0);
+      let rr = 5;
+      for (const p of st.payments) {
+        const row = w0.getRow(rr);
+        row.values = {
+          name: p.name, closed: p.pending ? 'פתוח' : p.closed, dec: r2(p.min / 60), exp: p.expected, carry: p.carry || '',
+          recv: p.pending ? '—' : p.received === null ? 'לא הוזן' : p.received,
+          gap: p.pending ? { formula: `D${rr}`, result: p.gap } : p.received === null ? '' : { formula: `D${rr}-F${rr}`, result: p.gap },
+          cum: { formula: rr === 5 ? `N(G${rr})` : `H${rr - 1}+N(G${rr})`, result: p.cum },
+        };
+        row.getCell('dec').numFmt = '0.00';
+        ['exp', 'carry', 'recv', 'gap', 'cum'].forEach((k) => (row.getCell(k).numFmt = MONEY));
+        rr++;
+      }
+      styleBody(w0, 5, rr - 1, c0.length);
+      for (let i = 5; i < rr; i++) {
+        const row = w0.getRow(i);
+        row.getCell('name').alignment = { horizontal: 'right', vertical: 'middle', indent: 1 };
+        row.getCell('gap').font = { name: FONT, bold: true, color: { argb: COL.open } };
+      }
+      // highlight the pending row
+      const pend = w0.getRow(rr - 1);
+      for (let c = 1; c <= c0.length; c++) { pend.getCell(c).fill = fill(COL.soft); pend.getCell(c).font = Object.assign({}, pend.getCell(c).font, { name: FONT, bold: true }); }
+      const t = w0.getRow(rr);
+      t.getCell(1).value = 'סה״כ מגיע עכשיו';
+      t.getCell(3).value = { formula: `SUM(C5:C${rr - 1})` };
+      t.getCell(4).value = { formula: `SUM(D5:D${rr - 1})` };
+      t.getCell(6).value = { formula: `SUM(F5:F${rr - 1})` };
+      t.getCell(8).value = { formula: `H${rr - 1}`, result: st.due };
+      totalRow(w0, rr, c0.length);
       t.getCell(1).alignment = { horizontal: 'right', vertical: 'middle', indent: 1 };
-      t.getCell(4).numFmt = MONEY;
-      t.getCell(4).font = { name: FONT, bold: true, size: 14, color: { argb: COL.brand } };
+      t.getCell(3).numFmt = '0.00'; [4, 6, 8].forEach((c) => (t.getCell(c).numFmt = MONEY));
+      t.getCell(8).font = { name: FONT, bold: true, size: 14, color: { argb: st.due > 0 ? COL.open : COL.paid } };
       t.height = 26;
+
+      // key totals
+      let k = rr + 2;
+      const kt = (label, val, bold, color) => {
+        w0.getCell(`A${k}`).value = label;
+        w0.getCell(`A${k}`).font = { name: FONT, bold: !!bold };
+        w0.getCell(`A${k}`).alignment = { horizontal: 'right', indent: 1 };
+        const c = w0.getCell(`D${k}`);
+        c.value = val; c.numFmt = MONEY; c.font = { name: FONT, bold: !!bold, color: color ? { argb: color } : undefined };
+        k++;
+      };
+      w0.getCell(`A${k}`).value = 'סיכום'; w0.getCell(`A${k}`).font = { name: FONT, bold: true, size: 12 }; k++;
+      kt(`שולם — לפי תעריף (${C.fmtDec(st.paidMin)} שעות, ${st.paidN} משמרות)`, st.paidExp);
+      kt('שולם — התקבל בפועל', st.recv);
+      kt(st.prevGap >= 0 ? 'פער פתוח מחשבונות קודמים (חסר)' : 'עודף מחשבונות קודמים', st.prevGap, true, st.prevGap > 0 ? COL.open : COL.paid);
+      kt(`ממתין לתשלום — לפי תעריף (${C.fmtDec(st.openMin)} שעות, ${st.openN} משמרות)`, st.openExp);
+      kt('סה״כ מגיע עכשיו (ממתין + פער)', st.due, true, COL.brand);
+
       // per worker
-      const pr = 5 + lines.length + 2;
-      const ph = ['עובד', 'ממתין (שעות)', 'ממתין לפי תעריף', 'פער קודם', 'מגיע עכשיו'];
-      w0.getCell(`A${pr - 1}`).value = 'לפי עובד';
-      w0.getCell(`A${pr - 1}`).font = { name: FONT, bold: true, size: 12 };
-      ['A', 'B', 'C', 'D', 'E'].forEach((L, i) => {
-        const c = w0.getCell(`${L}${pr}`);
-        c.value = ph[i]; c.font = { name: FONT, bold: true, color: { argb: 'FFFFFFFF' } }; c.fill = fill(COL.brand); c.alignment = { horizontal: 'center' };
+      k++;
+      w0.getCell(`A${k}`).value = 'לפי עובד'; w0.getCell(`A${k}`).font = { name: FONT, bold: true, size: 12 }; k++;
+      const ph = ['עובד', 'משמרות', 'שעות', 'שולם לפי תעריף', 'קיבל', 'פער קודם', 'ממתין לפי תעריף', 'מגיע עכשיו'];
+      const hr = k;
+      ph.forEach((h, i) => {
+        const c = w0.getRow(k).getCell(i + 1);
+        c.value = h; c.font = { name: FONT, bold: true, color: { argb: 'FFFFFFFF' } }; c.fill = fill(COL.brand); c.alignment = { horizontal: 'center', wrapText: true };
       });
-      w0.getColumn(5).width = 16;
-      w0.getColumn(2).width = 15;
-      w0.getColumn(3).width = 17;
-      let k = pr + 1;
+      w0.getRow(k).height = 30;
+      k++;
       for (const [w, r] of Object.entries(st.perW)) {
         const row = w0.getRow(k);
-        row.values = [wName(w), r.openMin / 1440, r.openExp, r.gap, { formula: `C${k}+D${k}`, result: r.due }];
-        row.getCell(2).numFmt = HM; [3, 4, 5].forEach((c) => (row.getCell(c).numFmt = MONEY));
+        row.values = [wName(w), r.n, r2(r.min / 60), r.paidExp, r.recv, r.gap, r.openExp, { formula: `F${k}+G${k}`, result: r.due }];
+        row.getCell(3).numFmt = '0.00'; [4, 5, 6, 7, 8].forEach((c) => (row.getCell(c).numFmt = MONEY));
         k++;
       }
-      styleBody(w0, pr + 1, k - 1, 5);
-      for (let i = pr + 1; i < k; i++) w0.getRow(i).getCell(5).font = { name: FONT, bold: true };
-      const note = w0.getCell(`A${k + 1}`);
+      styleBody(w0, hr + 1, k - 1, 8);
+      for (let i = hr + 1; i < k; i++) {
+        w0.getRow(i).getCell(1).font = { name: FONT, bold: true };
+        w0.getRow(i).getCell(8).font = { name: FONT, bold: true };
+      }
+      const tw = w0.getRow(k);
+      tw.getCell(1).value = 'סה״כ';
+      ['B', 'C', 'D', 'E', 'F', 'G', 'H'].forEach((L, i) => (tw.getCell(i + 2).value = { formula: `SUM(${L}${hr + 1}:${L}${k - 1})` }));
+      totalRow(w0, k, 8);
+      tw.getCell(3).numFmt = '0.00'; [4, 5, 6, 7, 8].forEach((c) => (tw.getCell(c).numFmt = MONEY));
+      const note = w0.getCell(`A${k + 2}`);
       note.value = 'פער = לפי תעריף פחות מה שהתקבל. חיובי = עוד מגיע כסף, שלילי = שולם יותר.';
       note.font = { name: FONT, size: 10, italic: true, color: { argb: COL.muted } };
     }
@@ -1133,68 +1176,6 @@
       const note = ws2.getCell(`A${r2row + 2}`);
       note.value = 'פער = לפי תעריף פחות מה שהתקבל. חיובי = עוד מגיע כסף, שלילי = שולם יותר.';
       note.font = { name: FONT, size: 10, italic: true, color: { argb: COL.muted } };
-    }
-
-    // ----- Sheet 3: payments account (whole team) -----
-    if (S.data.periods.length) {
-      const ws3 = wb.addWorksheet('חשבון תשלומים', { properties: { tabColor: { argb: COL.paid } } });
-      const cols3 = [
-        { key: 'name', h: 'תקופה', w: 26 }, { key: 'closed', h: 'נסגר', w: 12 }, { key: 'n', h: 'משמרות', w: 9 },
-        { key: 'dec', h: 'שעות', w: 10 }, { key: 'exp', h: 'לפי תעריף', w: 14 }, { key: 'carry', h: 'השלמת פער קודם', w: 15 },
-        { key: 'recv', h: 'התקבל', w: 14 }, { key: 'eff', h: 'תעריף אפקטיבי', w: 13 }, { key: 'gap', h: 'פער', w: 13 },
-        { key: 'cum', h: 'פער מצטבר', w: 14 },
-      ];
-      const hdr3 = header(ws3, 'חשבון תשלומים', `כל הצוות · ${S.data.periods.length} תשלומים · הופק ${stamp}`, cols3);
-      let rr = hdr3 + 1;
-      const chron = S.data.periods.slice().sort((a, b) => (a.closed_at < b.closed_at ? -1 : a.closed_at > b.closed_at ? 1 : a.id - b.id));
-      for (const p of chron) {
-        const a = periodAccount(p);
-        const mins = sumMin(a.list);
-        const row = ws3.getRow(rr);
-        row.values = {
-          name: p.name, closed: p.closed_at ? toDateCell(p.closed_at.slice(0, 10)) : '', n: a.list.length, dec: r2(mins / 60),
-          exp: a.expected, carry: a.carrySum || '', recv: a.received === null ? 'לא הוזן' : a.received,
-          eff: a.received !== null && mins ? { formula: `(G${rr}-N(F${rr}))/D${rr}`, result: r2((a.received - a.carrySum) / (mins / 60)) } : '',
-          gap: a.received === null ? '' : { formula: `E${rr}-G${rr}`, result: a.gap },
-          cum: { formula: rr === hdr3 + 1 ? `N(I${rr})` : `J${rr - 1}+N(I${rr})` },
-        };
-        row.getCell('closed').numFmt = 'd.m.yyyy';
-        row.getCell('dec').numFmt = '0.00';
-        ['exp', 'carry', 'recv', 'eff', 'gap', 'cum'].forEach((k) => (row.getCell(k).numFmt = MONEY));
-        row.getCell('name').alignment = { horizontal: 'right', vertical: 'middle' };
-        rr++;
-      }
-      styleBody(ws3, hdr3 + 1, rr - 1, cols3.length);
-      for (let i = hdr3 + 1; i < rr; i++) {
-        const g = ws3.getRow(i).getCell('gap');
-        g.font = { name: FONT, bold: true, color: { argb: COL.open } };
-      }
-      const bal = balance();
-      const t = ws3.getRow(rr);
-      t.getCell(1).value = bal.total >= 0 ? 'יתרה פתוחה (עוד מגיע)' : 'עודף ששולם';
-      t.getCell(4).value = { formula: `SUM(D${hdr3 + 1}:D${rr - 1})` };
-      t.getCell(5).value = { formula: `SUM(E${hdr3 + 1}:E${rr - 1})` };
-      t.getCell(7).value = { formula: `SUM(G${hdr3 + 1}:G${rr - 1})` };
-      t.getCell(10).value = { formula: `J${rr - 1}`, result: bal.total };
-      totalRow(ws3, rr, cols3.length);
-      t.getCell(4).numFmt = '0.00';
-      [5, 7, 10].forEach((c) => (t.getCell(c).numFmt = MONEY));
-      t.getCell(10).font = { name: FONT, bold: true, size: 13, color: { argb: bal.total > 0 ? COL.open : COL.paid } };
-      // per-worker running balance
-      const wr = rr + 2;
-      ws3.getCell(`A${wr}`).value = 'פער מצטבר לפי עובד';
-      ws3.getCell(`A${wr}`).font = { name: FONT, bold: true, size: 12 };
-      let k = wr + 1;
-      const allW = Object.keys(bal.byW);
-      for (const w of allW) {
-        ws3.getCell(`A${k}`).value = wName(w);
-        ws3.getCell(`B${k}`).value = bal.byW[w];
-        ws3.getCell(`B${k}`).numFmt = MONEY;
-        ws3.getCell(`A${k}`).font = { name: FONT };
-        ws3.getCell(`B${k}`).font = { name: FONT, bold: true, color: { argb: bal.byW[w] > 0 ? COL.open : COL.paid } };
-        k++;
-      }
-      if (!allW.length) { ws3.getCell(`A${k}`).value = 'אין פער — החשבון מאוזן'; ws3.getCell(`A${k}`).font = { name: FONT, color: { argb: COL.paid } }; }
     }
 
     const buf = await wb.xlsx.writeBuffer();
