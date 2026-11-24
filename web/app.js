@@ -351,24 +351,93 @@
   function periodSummary(p) {
     const list = periodShifts(p.id);
     const min = sumMin(list);
-    const eff = p.amount_received && min ? p.amount_received / (min / 60) : null;
+    // effective rate for these shifts only: an earlier gap paid off with this payment doesn't count
+    const carry = (() => { try { return p.carry_json ? Object.values(JSON.parse(p.carry_json)).reduce((a, b) => a + Number(b), 0) : 0; } catch { return 0; } })();
+    const eff = p.amount_received && min ? (p.amount_received - carry) / (min / 60) : null;
     return { list, min, eff };
+  }
+
+  // ---------- Account: what was owed by the rates vs what was actually paid ----------
+  const r2 = (n) => Math.round(n * 100) / 100;
+  function expectedByWorker(list) {
+    const out = {};
+    for (const s of list) out[s.worker_id] = (out[s.worker_id] || 0) + (C.shiftMinutes(s) / 60) * rateOf(workerById(s.worker_id));
+    return out;
+  }
+  const expectedOf = (list) => r2(Object.values(expectedByWorker(list)).reduce((a, b) => a + b, 0));
+  const carryOf = (p) => { try { return p.carry_json ? JSON.parse(p.carry_json) : {}; } catch { return {}; } };
+
+  // Per payment: expected, received, gap, and the same per worker (incl. earlier gap it paid off)
+  function periodAccount(p) {
+    const list = periodShifts(p.id);
+    const byExp = expectedByWorker(list);
+    const sumExpW = Object.values(byExp).reduce((a, b) => a + b, 0);
+    const expected = p.expected_amount !== null && p.expected_amount !== undefined ? Number(p.expected_amount) : r2(sumExpW);
+    const scale = sumExpW ? expected / sumExpW : 1;
+    const carry = carryOf(p);
+    const carrySum = r2(Object.values(carry).reduce((a, b) => a + Number(b), 0));
+    const received = p.amount_received !== null && p.amount_received !== undefined ? Number(p.amount_received) : null;
+    const mins = C.minutesByWorker(list);
+    const ids = [...new Set([...Object.keys(byExp), ...Object.keys(carry)].map(Number))];
+    const rows = {};
+    for (const w of ids) rows[w] = { minutes: mins[w] || 0, expected: r2((byExp[w] || 0) * scale), carry: Number(carry[w] || 0), paid: null, gap: null };
+    if (received !== null) {
+      const base = r2(received - carrySum);
+      const shares = base > 0 ? C.splitAmount(base, Object.keys(mins).map((k) => ({ key: Number(k), minutes: mins[k] }))) : [];
+      for (const w of ids) rows[w].paid = 0;
+      for (const x of shares) rows[x.key].paid += x.share;
+      for (const w of ids) { rows[w].paid = r2(rows[w].paid + rows[w].carry); rows[w].gap = r2(rows[w].expected - rows[w].paid); }
+    }
+    return { list, expected, received, carrySum, gap: received === null ? null : r2(expected - received), rows };
+  }
+
+  // Running balance over all payments. Positive = still owed to the team
+  function balance() {
+    const byW = {};
+    const items = [];
+    let total = 0;
+    for (const p of S.data.periods.slice().reverse()) {
+      const a = periodAccount(p);
+      if (a.gap === null) continue;
+      total += a.gap;
+      if (Math.abs(a.gap) >= 0.01) items.push({ p, gap: a.gap });
+      for (const [w, r] of Object.entries(a.rows)) byW[w] = r2((byW[w] || 0) + (r.gap || 0));
+    }
+    for (const w of Object.keys(byW)) if (Math.abs(byW[w]) < 0.01) delete byW[w];
+    return { total: r2(total), byW, items };
+  }
+  const gapLabel = (g) => (g > 0 ? `חסר ${C.fmtMoney(g, 2)}` : `עודף ${C.fmtMoney(-g, 2)}`);
+
+  function accountTable(rows) {
+    const ids = Object.keys(rows).map(Number);
+    const hasCarry = ids.some((w) => rows[w].carry);
+    const t = ids.reduce((a, w) => ({ m: a.m + rows[w].minutes, e: a.e + rows[w].expected, p: a.p + (rows[w].paid || 0), g: a.g + (rows[w].gap || 0), c: a.c + rows[w].carry }), { m: 0, e: 0, p: 0, g: 0, c: 0 });
+    const gapCell = (g) => `<td class="right" style="${g > 0.009 ? 'color:var(--open)' : g < -0.009 ? 'color:var(--paid)' : ''}">${Math.abs(g) < 0.01 ? '—' : N(C.fmtMoney(g, 2))}</td>`;
+    return `<table class="t"><thead><tr><th>עובד</th><th>שעות</th><th>לפי תעריף</th>${hasCarry ? '<th>השלמה</th>' : ''}<th>קיבל</th><th class="right">פער</th></tr></thead><tbody>
+      ${ids.map((w) => { const r = rows[w]; return `<tr><td>${esc(wName(w))}</td><td>${N(C.fmtDec(r.minutes))}</td><td>${N(C.fmtMoney(r.expected, 0))}</td>${hasCarry ? `<td>${r.carry ? N(C.fmtMoney(r.carry, 0)) : '—'}</td>` : ''}<td>${N(C.fmtMoney(r.paid, 0))}</td>${gapCell(r.gap)}</tr>`; }).join('')}
+      </tbody><tfoot><tr><td>סה״כ</td><td>${N(C.fmtDec(t.m))}</td><td>${N(C.fmtMoney(t.e, 0))}</td>${hasCarry ? `<td>${N(C.fmtMoney(t.c, 0))}</td>` : ''}<td>${N(C.fmtMoney(t.p, 0))}</td>${gapCell(t.g)}</tr></tfoot></table>`;
   }
 
   function viewPay() {
     const open = openShifts();
     const ps = S.data.periods.map((p) => {
       const { list, min, eff } = periodSummary(p);
+      const acc = periodAccount(p);
       const date = (p.closed_at || '').slice(0, 10);
       return `<div class="card" onclick="App.period(${p.id})" style="cursor:pointer">
         <div class="wrow"><div><div class="name">${esc(p.name)}</div><div class="meta">${date ? N(C.fmtDate(date)) + ' · ' : ''}${N(list.length)} משמרות · ${N(C.fmtDec(min))} שעות</div></div>
-        <div class="end"><div class="big">${N(C.fmtMoney(p.amount_received))}</div><div class="meta">${eff ? N(C.fmtMoney(eff, 2)) + ' לשעה' : '—'}</div></div></div></div>`;
+        <div class="end"><div class="big">${N(C.fmtMoney(p.amount_received))}</div><div class="meta">${eff ? N(C.fmtMoney(eff, 2)) + ' לשעה' : '—'}</div>${acc.gap !== null && Math.abs(acc.gap) >= 1 ? `<div class="meta" style="color:${acc.gap > 0 ? 'var(--open)' : 'var(--paid)'}">${gapLabel(acc.gap)}</div>` : ''}</div></div></div>`;
     }).join('');
+    const bal = balance();
     return `
       <div class="card">
         <div class="wrow"><div><div class="name">משמרות פתוחות</div><div class="meta">${N(open.length)} משמרות · ${hoursTxt(sumMin(open))}</div></div></div>
         <button class="btn dark block" style="margin-top:12px" ${open.length ? '' : 'disabled'} onclick="App.closePeriod()">סגירת תקופה — סימון כשולם</button>
       </div>
+      ${Math.abs(bal.total) >= 1 ? `<div class="card" style="margin-top:10px;border-color:${bal.total > 0 ? 'var(--open)' : 'var(--paid)'}">
+        <div class="wrow"><div><div class="name">${bal.total > 0 ? 'פער פתוח מחשבונות קודמים' : 'שולם ביתר בחשבונות קודמים'}</div>
+        <div class="meta">${Object.entries(bal.byW).map(([w, g]) => `${esc(wName(w))} ${N(C.fmtMoney(g, 0))}`).join(' · ')}</div></div>
+        <div class="end"><div class="big" style="color:${bal.total > 0 ? 'var(--open)' : 'var(--paid)'}">${N(C.fmtMoney(Math.abs(bal.total), 2))}</div><div class="meta">לפי תעריף פחות מה ששולם</div></div></div></div>` : ''}
       <h2>תשלומים שהתקבלו</h2>
       <div class="list">${ps || '<div class="empty">עוד לא נסגרה אף תקופה</div>'}</div>`;
   }
@@ -383,6 +452,34 @@
       </tbody><tfoot><tr><td>סה״כ</td><td>${N(C.fmtHM(total))} <span class="muted small">${N(C.fmtDec(total))}</span></td>${amount ? `<td class="right">${N(C.fmtMoney(amount, 2))}</td>` : ''}</tr></tfoot></table>`;
   }
 
+  function carryBox() {
+    const bal = balance();
+    if (Math.abs(bal.total) < 1) return '';
+    const owed = bal.total > 0;
+    return `<div class="preview" style="display:block;background:${owed ? 'var(--open-soft)' : 'var(--paid-soft)'};margin-top:14px">
+      <small>${owed ? 'נשאר פער מחשבונות קודמים' : 'שולם ביתר בחשבונות קודמים'}</small>
+      <div><b class="num" style="color:${owed ? 'var(--open)' : 'var(--paid)'}">${C.fmtMoney(Math.abs(bal.total), 2)}</b></div>
+      <div class="mini" style="margin-top:4px">${bal.items.map((x) => `${esc(x.p.name)}: ${gapLabel(x.gap)}`).join('<br>')}</div>
+      <div class="mini" style="margin-top:4px">לפי עובד: ${Object.entries(bal.byW).map(([w, g]) => `${esc(wName(w))} ${N(C.fmtMoney(g, 2))}`).join(' · ')}</div>
+      <label class="check" style="border:0;padding-bottom:0"><input type="checkbox" id="inc"><span class="grow">${owed ? 'להוסיף את הפער לסכום לתשלום' : 'לקזז את העודף מהסכום לתשלום'}</span></label>
+    </div>`;
+  }
+
+  // Split for a new payment: the part for these shifts by hours, plus each worker's earlier gap if it's included
+  function closeSplit(list, amount, carryW) {
+    if (!carryW) return splitTable(list, amount);
+    const carrySum = r2(Object.values(carryW).reduce((a, b) => a + b, 0));
+    const mins = C.minutesByWorker(list);
+    const base = r2(amount - carrySum);
+    const shares = base > 0 ? C.splitAmount(base, Object.keys(mins).map((k) => ({ key: Number(k), minutes: mins[k] }))) : [];
+    const ids = [...new Set([...Object.keys(mins), ...Object.keys(carryW)].map(Number))];
+    const share = (w) => (shares.find((x) => x.key === w) || {}).share || 0;
+    const tot = ids.reduce((a, w) => ({ m: a.m + (mins[w] || 0), s: a.s + share(w), c: a.c + (carryW[w] || 0) }), { m: 0, s: 0, c: 0 });
+    return `<table class="t"><thead><tr><th>עובד</th><th>שעות</th><th>על המשמרות</th><th>פער קודם</th><th class="right">לתשלום</th></tr></thead><tbody>
+      ${ids.map((w) => `<tr><td>${esc(wName(w))}</td><td>${N(C.fmtDec(mins[w] || 0))}</td><td>${N(C.fmtMoney(share(w), 2))}</td><td>${carryW[w] ? N(C.fmtMoney(carryW[w], 2)) : '—'}</td><td class="right"><b>${N(C.fmtMoney(r2(share(w) + (carryW[w] || 0)), 2))}</b></td></tr>`).join('')}
+      </tbody><tfoot><tr><td>סה״כ</td><td>${N(C.fmtDec(tot.m))}</td><td>${N(C.fmtMoney(tot.s, 2))}</td><td>${N(C.fmtMoney(tot.c, 2))}</td><td class="right">${N(C.fmtMoney(r2(tot.s + tot.c), 2))}</td></tr></tfoot></table>`;
+  }
+
   function closePeriodSheet() {
     const open = openShifts().slice().sort((a, b) => (a.date < b.date ? -1 : 1));
     if (!open.length) return toast('אין משמרות פתוחות');
@@ -393,9 +490,11 @@
       <div class="mini">המשמרות שיסומנו יעברו ל"שולם". משמרות חדשות ייכנסו לתקופה הבאה.</div>
       <label class="f">שם התקופה</label>
       <input class="in" id="pn" value="${esc(defName)}">
+      ${carryBox()}
       <label class="f">סכום לתשלום</label>
       <input class="in" id="pa" inputmode="decimal" placeholder="למשל 13200">
       <div class="mini" id="exp" style="margin-top:6px"></div>
+      <div class="mini" id="after" style="margin-top:4px"></div>
       <div class="preview"><div><small>תעריף אפקטיבי לשעה</small><div><b id="eff" class="num">—</b></div></div><div class="mini" id="hrs"></div></div>
       <label class="f">משמרות בתקופה</label>
       <div class="chips" style="margin-bottom:6px"><button type="button" class="chip" id="all">סמן הכל</button><button type="button" class="chip" id="none">נקה</button>
@@ -406,29 +505,39 @@
       const q = (id) => el.querySelector('#' + id);
       const boxes = () => [...el.querySelectorAll('#cl input')];
       const sel = () => boxes().filter((b) => b.checked).map((b) => Number(b.dataset.id));
-      // The amount starts as what the rates say is owed; once typed over, it stays as typed
+      // The amount starts as what the rates say is owed (+ earlier gap if chosen); once typed over, it stays as typed
       let touched = false;
-      const expectedFor = (list) => Math.round(list.reduce((a, s) => a + (C.shiftMinutes(s) / 60) * rateOf(workerById(s.worker_id)), 0) * 100) / 100;
+      const bal = balance();
+      const incBox = q('inc');
+      const inc = () => !!(incBox && incBox.checked);
+      const carryAmt = () => (inc() ? bal.total : 0);
+      const expectedFor = expectedOf;
       const fmtIn = (n) => (Math.abs(n - Math.round(n)) < 0.005 ? String(Math.round(n)) : n.toFixed(2));
       const upd = () => {
         const ids = sel();
         const list = open.filter((s) => ids.includes(s.id));
         const min = sumMin(list);
         const exp = expectedFor(list);
-        if (!touched) q('pa').value = exp ? fmtIn(exp) : '';
+        const target = r2(exp + carryAmt());
+        if (!touched) q('pa').value = target ? fmtIn(target) : '';
         const amt = parseFloat(String(q('pa').value).replace(/,/g, ''));
-        const diff = touched && amt > 0 && Math.abs(amt - exp) >= 0.01;
+        const diff = touched && amt > 0 && Math.abs(amt - target) >= 0.01;
+        const carryTxt = inc() ? ` ${bal.total > 0 ? '+' : '−'} פער קודם ${N(C.fmtMoney(Math.abs(bal.total), 2))}` : '';
         q('exp').innerHTML = !list.length ? '' : !touched
-          ? `מחושב לפי התעריף (${N(C.fmtMoney(S.data.settings.default_rate))} לשעה). אפשר לשנות לסכום שהתקבל בפועל.`
-          : `לפי התעריף היה יוצא ${N(C.fmtMoney(exp, 2))}${diff ? ` · הפרש ${N(C.fmtMoney(amt - exp, 2))}` : ''} · <a href="#" id="rst" style="color:var(--accent)">חזרה לחישוב</a>`;
+          ? `לפי התעריף ${N(C.fmtMoney(exp, 2))}${carryTxt}${inc() ? ` = ${N(C.fmtMoney(target, 2))}` : ''}. אפשר לשנות לסכום שהתקבל בפועל.`
+          : `לפי החישוב היה יוצא ${N(C.fmtMoney(target, 2))}${diff ? ` · הפרש ${N(C.fmtMoney(amt - target, 2))}` : ''} · <a href="#" id="rst" style="color:var(--accent)">חזרה לחישוב</a>`;
+        const left = r2(bal.total + exp - (amt > 0 ? amt : 0));
+        q('after').innerHTML = list.length && amt > 0 && (Math.abs(bal.total) >= 1 || Math.abs(left) >= 1)
+          ? `אחרי הסגירה: ${Math.abs(left) < 1 ? '<b style="color:var(--paid)">החשבון מאוזן ✓</b>' : `<b style="color:${left > 0 ? 'var(--open)' : 'var(--paid)'}">${left > 0 ? 'יישאר פער של' : 'יהיה עודף של'} ${N(C.fmtMoney(Math.abs(left), 2))}</b>`}` : '';
         const r = q('rst'); if (r) r.onclick = (e) => { e.preventDefault(); touched = false; upd(); };
         q('hrs').innerHTML = `${N(ids.length)} משמרות · ${N(C.fmtDec(min))} שעות`;
-        q('eff').textContent = amt > 0 && min ? C.fmtMoney(amt / (min / 60), 2) : '—';
-        q('split').innerHTML = list.length ? splitTable(list, amt > 0 ? amt : 0) : '';
+        q('eff').textContent = amt > 0 && min ? C.fmtMoney((amt - carryAmt()) / (min / 60), 2) : '—';
+        q('split').innerHTML = list.length ? closeSplit(list, amt > 0 ? amt : 0, inc() ? bal.byW : null) : '';
         q('ok').textContent = `סגירה ושמירה (${ids.length})`;
       };
       el.querySelectorAll('#cl input').forEach((b) => b.onchange = upd);
       q('pa').oninput = () => { touched = true; upd(); };
+      if (incBox) incBox.onchange = () => { touched = false; upd(); };
       q('all').onclick = () => { boxes().forEach((b) => b.checked = true); upd(); };
       q('none').onclick = () => { boxes().forEach((b) => b.checked = false); upd(); };
       el.querySelectorAll('[data-w]').forEach((c) => c.onclick = () => {
@@ -441,7 +550,9 @@
         const ids = sel();
         if (!ids.length) return toast('לא נבחרו משמרות');
         const amt = parseFloat(String(q('pa').value).replace(/,/g, ''));
-        act('POST', '/api/periods', { name: q('pn').value, amount_received: amt > 0 ? amt : null, shift_ids: ids }, 'התקופה נסגרה ✓');
+        const list = open.filter((s) => ids.includes(s.id));
+        act('POST', '/api/periods', { name: q('pn').value, amount_received: amt > 0 ? amt : null, shift_ids: ids,
+          expected_amount: expectedOf(list), carry: inc() ? bal.byW : null }, 'התקופה נסגרה ✓');
       };
     });
   }
@@ -463,9 +574,20 @@
           <div class="card stat"><div class="lbl">סכום שהתקבל</div><div class="val" style="font-size:22px">${N(C.fmtMoney(p.amount_received))}</div><div class="sub">${N(C.fmtDec(min))} שעות</div></div>
           <div class="card stat"><div class="lbl">תעריף אפקטיבי</div><div class="val" style="font-size:22px">${eff ? N(C.fmtMoney(eff, 2)) : '—'}</div><div class="sub">לשעה</div></div>
         </div>
+        ${(() => {
+          const a = periodAccount(p);
+          if (a.gap === null) return '';
+          const col = a.gap > 0.009 ? 'var(--open)' : a.gap < -0.009 ? 'var(--paid)' : 'var(--muted)';
+          return `<div class="preview" style="display:block">
+            <div class="kv"><span>לפי התעריף</span><span class="num">${C.fmtMoney(a.expected, 2)}</span></div>
+            ${a.carrySum ? `<div class="kv"><span>כולל השלמת פער קודם</span><span class="num">${C.fmtMoney(a.carrySum, 2)}</span></div>` : ''}
+            <div class="kv"><span>התקבל</span><span class="num">${C.fmtMoney(a.received, 2)}</span></div>
+            <div class="kv" style="font-weight:600"><span>פער בחשבון הזה</span><span class="num" style="color:${col}">${Math.abs(a.gap) < 0.01 ? 'אין' : C.fmtMoney(a.gap, 2)}</span></div>
+          </div>`;
+        })()}
         ${p.note ? `<div class="mini" style="margin-top:12px">הערה: ${esc(p.note)}</div>` : ''}
-        <h2 style="margin:18px 0 6px">חלוקה לפי עובד</h2>
-        ${splitTable(list, p.amount_received > 0 ? p.amount_received : 0)}
+        <h2 style="margin:18px 0 6px">החשבון לפי עובד</h2>
+        ${p.amount_received > 0 ? accountTable(periodAccount(p).rows) : splitTable(list, 0)}
         <details style="margin-top:14px"><summary class="muted small" style="cursor:pointer">המשמרות בתקופה (${list.length})</summary><div style="margin-top:6px">${shiftsHtml}</div></details>
         <div class="acts"><button class="btn ghost" id="ed">✎ עריכה</button></div>`, (el) => {
         el.querySelector('#ed').onclick = () => periodSheet(id, true);
@@ -580,7 +702,7 @@
       <div class="card"><button class="btn dark block" onclick="App.go('admin')">אזור ניהול — כניסות ולוגים</button></div>
       <h2>נתונים</h2>
       <div class="card stack">
-        <button class="btn ghost block" onclick="App.csv()">ייצוא לאקסל (CSV)</button>
+        <button class="btn ghost block" onclick="App.csv()">⬇ ייצוא לאקסל</button>
         <button class="btn danger block" onclick="App.logout()">התנתקות מהמכשיר הזה</button>
       </div>`;
   }
@@ -600,18 +722,364 @@
     });
   }
 
+  // ---------- Export (Excel / CSV) ----------
+  const XS = { scope: 'open', period: null, worker: 'all' };
+  const SCOPES = [['open', 'ממתין לתשלום'], ['paid', 'שולם'], ['all', 'הכל'], ['period', 'תקופה']];
+
+  function exportShifts() {
+    let list = S.data.shifts;
+    if (XS.scope === 'open') list = list.filter((s) => !s.period_id);
+    else if (XS.scope === 'paid') list = list.filter((s) => s.period_id);
+    else if (XS.scope === 'period') list = list.filter((s) => s.period_id === Number(XS.period));
+    if (XS.worker !== 'all') list = list.filter((s) => s.worker_id === Number(XS.worker));
+    return list.slice().sort((a, b) => (a.date === b.date ? String(a.start_time || '').localeCompare(String(b.start_time || '')) : a.date < b.date ? -1 : 1));
+  }
+  function exportLabels() {
+    const p = S.data.periods.find((x) => x.id === Number(XS.period));
+    const scope = XS.scope === 'period' ? 'תקופה ' + (p ? p.name : '') : (SCOPES.find((x) => x[0] === XS.scope) || [])[1];
+    const worker = XS.worker === 'all' ? 'כל העובדים' : wName(XS.worker);
+    return { scope, worker };
+  }
+
+  function exportSheet() {
+    if (!XS.period && S.data.periods[0]) XS.period = S.data.periods[0].id;
+    const draw = (el) => {
+      const list = exportShifts();
+      const min = sumMin(list);
+      el.querySelector('#xsum').innerHTML = list.length
+        ? `<div><small>ייכנסו לקובץ</small><div><b class="num">${list.length}</b> משמרות · <span class="num">${C.fmtDec(min)}</span> שעות</div></div><div class="mini num">${C.fmtMoney(expectedOf(list), 0)} לפי תעריף</div>`
+        : '<div><small>אין משמרות בבחירה הזו</small></div>';
+      el.querySelector('#xgo').disabled = !list.length;
+      el.querySelector('#xcsv').disabled = !list.length;
+    };
+    openSheet(`<div class="sh-head"><div><h3>ייצוא לאקסל</h3><div class="mini">בחרו מה להוציא לקובץ</div></div><button class="xbtn" aria-label="סגירה" onclick="App.close()">×</button></div>
+      <label class="f">אילו משמרות</label>
+      <div class="seg" id="xs">${SCOPES.filter(([k]) => k !== 'period' || S.data.periods.length).map(([k, t]) => `<button type="button" data-s="${k}" class="${XS.scope === k ? 'on' : ''}">${t}</button>`).join('')}</div>
+      <select class="in" id="xp" style="margin-top:8px;${XS.scope === 'period' ? '' : 'display:none'}">${S.data.periods.map((p) => `<option value="${p.id}" ${Number(XS.period) === p.id ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}</select>
+      <label class="f">עובד</label>
+      <div class="chips" id="xw"><button type="button" class="chip ${XS.worker === 'all' ? 'on' : ''}" data-w="all">כולם</button>${workers().map((w) => `<button type="button" class="chip ${String(XS.worker) === String(w.id) ? 'on' : ''}" data-w="${w.id}">${esc(w.name)}</button>`).join('')}</div>
+      <div class="preview" id="xsum"></div>
+      <div class="mini" style="margin-top:10px">בקובץ: גיליון משמרות עם סה״כ, סיכום לפי עובד, וחשבון התשלומים עם הפער המצטבר.</div>
+      <button class="btn primary block" id="xgo" style="margin-top:16px">⬇ הורדת קובץ אקסל</button>
+      <button class="btn ghost block" id="xcsv" style="margin-top:8px">או CSV פשוט</button>`, (el) => {
+      el.querySelectorAll('#xs [data-s]').forEach((b) => b.onclick = () => {
+        XS.scope = b.dataset.s;
+        el.querySelectorAll('#xs [data-s]').forEach((x) => x.classList.toggle('on', x === b));
+        el.querySelector('#xp').style.display = XS.scope === 'period' ? '' : 'none';
+        draw(el);
+      });
+      el.querySelector('#xp').onchange = (e) => { XS.period = Number(e.target.value); draw(el); };
+      el.querySelectorAll('#xw [data-w]').forEach((b) => b.onclick = () => {
+        XS.worker = b.dataset.w;
+        el.querySelectorAll('#xw [data-w]').forEach((x) => x.classList.toggle('on', x === b));
+        draw(el);
+      });
+      el.querySelector('#xcsv').onclick = exportCsv;
+      el.querySelector('#xgo').onclick = async () => {
+        const btn = el.querySelector('#xgo');
+        btn.disabled = true; btn.textContent = 'מכין קובץ…';
+        try { await exportXlsx(); } catch (e) { toast('הייצוא נכשל: ' + e.message); }
+        btn.disabled = false; btn.textContent = '⬇ הורדת קובץ אקסל';
+      };
+      draw(el);
+    });
+  }
+
+  function fileName(ext) {
+    const { scope, worker } = exportLabels();
+    const d = new Date();
+    return `משמרות - ${scope}${XS.worker === 'all' ? '' : ' - ' + worker} - ${d.getDate()}.${d.getMonth() + 1}.${d.getFullYear()}.${ext}`.replace(/[\\/:*?"<>|]/g, '-');
+  }
+  function download(blob, name) {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 2000);
+  }
+
   function exportCsv() {
     const periodName = (pid) => (S.data.periods.find((p) => p.id === pid) || {}).name || '';
-    const rows = [['תאריך', 'יום', 'עובד', 'התחלה', 'סיום', 'תוספת (דקות)', 'שעות', 'שעות עשרוני', 'סטטוס', 'תקופה', 'הערה']];
-    S.data.shifts.slice().sort((a, b) => (a.date < b.date ? -1 : 1)).forEach((s) => {
+    const list = exportShifts();
+    const rows = [['תאריך', 'יום', 'עובד', 'התחלה', 'סיום', 'תוספת', 'שעות', 'שעות עשרוני', 'תעריף', 'לפי תעריף', 'סטטוס', 'תקופה', 'הערה']];
+    let tm = 0, tx = 0;
+    list.forEach((s) => {
       const m = C.shiftMinutes(s);
-      rows.push([C.fmtDate(s.date), C.dayName(s.date), wName(s.worker_id), s.start_time || '', s.end_time || '', s.extra_minutes || 0, C.fmtHM(m), C.fmtDec(m), s.period_id ? 'שולם' : 'ממתין', periodName(s.period_id), s.note || '']);
+      const rate = rateOf(workerById(s.worker_id));
+      tm += m; tx += (m / 60) * rate;
+      rows.push([C.fmtDate(s.date), C.dayName(s.date), wName(s.worker_id), s.start_time || '', s.end_time || '', s.extra_minutes ? C.fmtHM(s.extra_minutes) : '', C.fmtHM(m), C.fmtDec(m), rate, r2((m / 60) * rate).toFixed(2), s.period_id ? 'שולם' : 'ממתין', periodName(s.period_id), s.note || '']);
     });
+    rows.push(['סה״כ', '', `${list.length} משמרות`, '', '', '', C.fmtHM(tm), C.fmtDec(tm), '', r2(tx).toFixed(2), '', '', '']);
     const csv = '﻿' + rows.map((r) => r.map((v) => '"' + String(v).replace(/"/g, '""') + '"').join(',')).join('\r\n');
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
-    a.download = `shifts-${today()}.csv`;
-    a.click();
+    download(new Blob([csv], { type: 'text/csv;charset=utf-8' }), fileName('csv'));
+  }
+
+  let excelLoading = null;
+  function loadExcel() {
+    if (window.ExcelJS) return Promise.resolve(window.ExcelJS);
+    if (!excelLoading) {
+      excelLoading = new Promise((res, rej) => {
+        const sc = document.createElement('script');
+        sc.src = 'vendor/exceljs.min.js';
+        sc.onload = () => (window.ExcelJS ? res(window.ExcelJS) : rej(new Error('הספרייה לא נטענה')));
+        sc.onerror = () => { excelLoading = null; rej(new Error('אין חיבור לטעינת הספרייה')); };
+        document.head.appendChild(sc);
+      });
+    }
+    return excelLoading;
+  }
+
+  async function exportXlsx() {
+    const ExcelJS = await loadExcel();
+    const list = exportShifts();
+    const { scope, worker } = exportLabels();
+    const periodName = (pid) => (S.data.periods.find((p) => p.id === pid) || {}).name || '';
+    const now = new Date();
+    const stamp = `${now.getDate()}.${now.getMonth() + 1}.${now.getFullYear()} ${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+
+    const COL = { brand: 'FF1F2A44', accent: 'FFE0893A', soft: 'FFFBEEDF', zebra: 'FFF7F5F1', line: 'FFE6E2DA', paid: 'FF15803D', open: 'FFC2410C', muted: 'FF6B7280' };
+    const FONT = 'Arial';
+    const fill = (argb) => ({ type: 'pattern', pattern: 'solid', fgColor: { argb } });
+    const thin = { style: 'thin', color: { argb: COL.line } };
+    const MONEY = '₪#,##0.00;[Red]-₪#,##0.00';
+    const MONEY0 = '₪#,##0;[Red]-₪#,##0';
+    const HM = '[h]:mm';
+
+    const wb = new ExcelJS.Workbook();
+    wb.creator = 'משמרות';
+    wb.created = now;
+
+    // Title block + header row; returns the header row number
+    function header(ws, title, sub, cols) {
+      ws.views = [{ rightToLeft: true, state: 'frozen', ySplit: 4 }];
+      ws.pageSetup = { orientation: 'landscape', fitToPage: true, fitToWidth: 1, fitToHeight: 0, paperSize: 9, margins: { left: 0.4, right: 0.4, top: 0.5, bottom: 0.5, header: 0.2, footer: 0.2 } };
+      ws.pageSetup.printTitlesRow = '4:4';
+      ws.columns = cols.map((c) => ({ key: c.key, width: c.w }));
+      const last = String.fromCharCode(64 + cols.length);
+      ws.mergeCells(`A1:${last}1`);
+      ws.mergeCells(`A2:${last}2`);
+      const t = ws.getCell('A1');
+      t.value = title;
+      t.font = { name: FONT, size: 16, bold: true, color: { argb: 'FFFFFFFF' } };
+      t.fill = fill(COL.brand);
+      t.alignment = { vertical: 'middle', horizontal: 'right', indent: 1 };
+      ws.getRow(1).height = 32;
+      const st = ws.getCell('A2');
+      st.value = sub;
+      st.font = { name: FONT, size: 10, color: { argb: COL.muted } };
+      st.alignment = { horizontal: 'right', indent: 1 };
+      ws.getRow(2).height = 18;
+      const hr = ws.getRow(4);
+      cols.forEach((c, i) => {
+        const cell = hr.getCell(i + 1);
+        cell.value = c.h;
+        cell.font = { name: FONT, bold: true, color: { argb: 'FFFFFFFF' } };
+        cell.fill = fill(COL.accent);
+        cell.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true };
+        cell.border = { bottom: thin };
+      });
+      hr.height = 30;
+      return 4;
+    }
+    function styleBody(ws, from, to, ncols) {
+      for (let r = from; r <= to; r++) {
+        const row = ws.getRow(r);
+        for (let c = 1; c <= ncols; c++) {
+          const cell = row.getCell(c);
+          cell.font = Object.assign({ name: FONT, size: 11 }, cell.font || {});
+          cell.border = { bottom: thin };
+          if ((r - from) % 2 === 1) cell.fill = fill(COL.zebra);
+          if (!cell.alignment) cell.alignment = { horizontal: 'center', vertical: 'middle' };
+        }
+      }
+    }
+    function totalRow(ws, r, ncols) {
+      const row = ws.getRow(r);
+      for (let c = 1; c <= ncols; c++) {
+        const cell = row.getCell(c);
+        cell.font = { name: FONT, bold: true, size: 12 };
+        cell.fill = fill(COL.soft);
+        cell.border = { top: { style: 'medium', color: { argb: COL.accent } } };
+        cell.alignment = { horizontal: 'center', vertical: 'middle' };
+      }
+      row.height = 22;
+    }
+    const toDateCell = (d) => { const [y, m, dd] = d.split('-').map(Number); return new Date(Date.UTC(y, m - 1, dd)); };
+
+    // ----- Sheet 1: shifts -----
+    const ws = wb.addWorksheet('משמרות', { properties: { tabColor: { argb: COL.accent } } });
+    const cols = [
+      { key: 'date', h: 'תאריך', w: 12 }, { key: 'day', h: 'יום', w: 9 }, { key: 'worker', h: 'עובד', w: 12 },
+      { key: 'start', h: 'התחלה', w: 9 }, { key: 'end', h: 'סיום', w: 9 }, { key: 'extra', h: 'תוספת', w: 9 },
+      { key: 'hm', h: 'שעות', w: 10 }, { key: 'dec', h: 'שעות (עשרוני)', w: 12 }, { key: 'rate', h: 'תעריף', w: 9 },
+      { key: 'amount', h: 'לפי תעריף', w: 13 }, { key: 'status', h: 'סטטוס', w: 10 }, { key: 'period', h: 'תקופה', w: 24 },
+      { key: 'note', h: 'הערה', w: 28 },
+    ];
+    const hdr = header(ws, `דוח משמרות — ${scope}`, `${worker} · ${list.length} משמרות · הופק ${stamp}`, cols);
+    let r = hdr + 1;
+    for (const s of list) {
+      const m = C.shiftMinutes(s);
+      const rate = rateOf(workerById(s.worker_id));
+      const manual = s.hours_override !== null && s.hours_override !== undefined;
+      const row = ws.getRow(r);
+      row.values = {
+        date: toDateCell(s.date), day: C.dayName(s.date), worker: wName(s.worker_id),
+        start: manual ? 'ידני' : s.start_time || '', end: manual ? '' : s.end_time || '',
+        extra: s.extra_minutes ? (s.extra_minutes > 0 ? '+' : '') + C.fmtHM(s.extra_minutes) : '',
+        hm: m / 1440, dec: r2(m / 60), rate,
+        amount: { formula: `H${r}*I${r}`, result: r2((m / 60) * rate) },
+        status: s.period_id ? 'שולם' : 'ממתין', period: periodName(s.period_id), note: s.note || '',
+      };
+      row.getCell('date').numFmt = 'd.m.yyyy';
+      row.getCell('hm').numFmt = HM;
+      row.getCell('dec').numFmt = '0.00';
+      row.getCell('rate').numFmt = MONEY0;
+      row.getCell('amount').numFmt = MONEY;
+      row.getCell('status').font = { name: FONT, bold: true, color: { argb: s.period_id ? COL.paid : COL.open } };
+      row.getCell('note').alignment = { horizontal: 'right', vertical: 'middle', wrapText: true };
+      row.getCell('period').alignment = { horizontal: 'right', vertical: 'middle' };
+      r++;
+    }
+    const lastData = r - 1;
+    styleBody(ws, hdr + 1, lastData, cols.length);
+    if (list.length) {
+      ws.autoFilter = { from: { row: hdr, column: 1 }, to: { row: lastData, column: cols.length } };
+      const t = ws.getRow(r);
+      t.getCell(1).value = 'סה״כ';
+      t.getCell(3).value = { formula: `COUNTA(C${hdr + 1}:C${lastData})&" משמרות"`, result: `${list.length} משמרות` };
+      t.getCell(7).value = { formula: `SUM(G${hdr + 1}:G${lastData})`, result: sumMin(list) / 1440 };
+      t.getCell(8).value = { formula: `SUM(H${hdr + 1}:H${lastData})`, result: r2(sumMin(list) / 60) };
+      t.getCell(10).value = { formula: `SUM(J${hdr + 1}:J${lastData})`, result: expectedOf(list) };
+      totalRow(ws, r, cols.length);
+      t.getCell(7).numFmt = HM; t.getCell(8).numFmt = '0.00'; t.getCell(10).numFmt = MONEY;
+    }
+
+    // ----- Sheet 2: per worker -----
+    const ws2 = wb.addWorksheet('סיכום לפי עובד', { properties: { tabColor: { argb: COL.brand } } });
+    const involved = new Set(list.filter((s) => s.period_id).map((s) => s.period_id));
+    const showPaid = involved.size > 0;
+    const cols2 = [
+      { key: 'worker', h: 'עובד', w: 14 }, { key: 'n', h: 'משמרות', w: 10 }, { key: 'hm', h: 'שעות', w: 10 },
+      { key: 'dec', h: 'שעות (עשרוני)', w: 13 }, { key: 'rate', h: 'תעריף', w: 10 }, { key: 'exp', h: 'לפי תעריף', w: 14 },
+    ].concat(showPaid ? [{ key: 'paid', h: 'קיבל', w: 14 }, { key: 'gap', h: 'פער', w: 13 }] : [])
+     .concat(list.some((s) => !s.period_id) ? [{ key: 'open', h: 'ממתין לתשלום', w: 15 }] : []);
+    const hdr2 = header(ws2, `סיכום לפי עובד — ${scope}`, `${worker} · הופק ${stamp}`, cols2);
+    const byW = {};
+    for (const s of list) (byW[s.worker_id] = byW[s.worker_id] || []).push(s);
+    // paid/gap per worker from the payments these shifts belong to (whole payment, all its workers' shares)
+    const paidW = {}, gapW = {};
+    for (const pid of involved) {
+      const p = S.data.periods.find((x) => x.id === pid);
+      if (!p) continue;
+      const a = periodAccount(p);
+      for (const [w, row] of Object.entries(a.rows)) {
+        if (XS.worker !== 'all' && Number(w) !== Number(XS.worker)) continue;
+        paidW[w] = r2((paidW[w] || 0) + (row.paid || 0));
+        gapW[w] = r2((gapW[w] || 0) + (row.gap || 0));
+      }
+    }
+    let r2row = hdr2 + 1;
+    const wIds = [...new Set([...Object.keys(byW), ...Object.keys(paidW)].map(Number))];
+    for (const w of wIds) {
+      const sl = byW[w] || [];
+      const m = sumMin(sl);
+      const row = ws2.getRow(r2row);
+      const v = { worker: wName(w), n: sl.length, hm: m / 1440, dec: r2(m / 60), rate: rateOf(workerById(w)), exp: expectedOf(sl) };
+      if (showPaid) { v.paid = paidW[w] || 0; v.gap = gapW[w] || 0; }
+      if (cols2.some((c) => c.key === 'open')) v.open = expectedOf(sl.filter((s) => !s.period_id));
+      row.values = v;
+      row.getCell('hm').numFmt = HM; row.getCell('dec').numFmt = '0.00'; row.getCell('rate').numFmt = MONEY0;
+      ['exp', 'paid', 'gap', 'open'].forEach((k) => { if (cols2.some((c) => c.key === k)) row.getCell(k).numFmt = MONEY; });
+      row.getCell('worker').font = { name: FONT, bold: true };
+      r2row++;
+    }
+    styleBody(ws2, hdr2 + 1, r2row - 1, cols2.length);
+    if (wIds.length) {
+      const t = ws2.getRow(r2row);
+      cols2.forEach((c, i) => {
+        const L = String.fromCharCode(65 + i);
+        if (i === 0) t.getCell(1).value = 'סה״כ';
+        else if (c.key !== 'rate') t.getCell(i + 1).value = { formula: `SUM(${L}${hdr2 + 1}:${L}${r2row - 1})` };
+      });
+      totalRow(ws2, r2row, cols2.length);
+      cols2.forEach((c, i) => {
+        const cell = t.getCell(i + 1);
+        if (c.key === 'hm') cell.numFmt = HM; else if (c.key === 'dec') cell.numFmt = '0.00';
+        else if (['exp', 'paid', 'gap', 'open'].includes(c.key)) cell.numFmt = MONEY;
+      });
+    }
+    if (showPaid) {
+      const note = ws2.getCell(`A${r2row + 2}`);
+      note.value = 'פער = לפי תעריף פחות מה שהתקבל. חיובי = עוד מגיע כסף, שלילי = שולם יותר.';
+      note.font = { name: FONT, size: 10, italic: true, color: { argb: COL.muted } };
+    }
+
+    // ----- Sheet 3: payments account (whole team) -----
+    if (S.data.periods.length) {
+      const ws3 = wb.addWorksheet('חשבון תשלומים', { properties: { tabColor: { argb: COL.paid } } });
+      const cols3 = [
+        { key: 'name', h: 'תקופה', w: 26 }, { key: 'closed', h: 'נסגר', w: 12 }, { key: 'n', h: 'משמרות', w: 9 },
+        { key: 'dec', h: 'שעות', w: 10 }, { key: 'exp', h: 'לפי תעריף', w: 14 }, { key: 'carry', h: 'השלמת פער קודם', w: 15 },
+        { key: 'recv', h: 'התקבל', w: 14 }, { key: 'eff', h: 'תעריף אפקטיבי', w: 13 }, { key: 'gap', h: 'פער', w: 13 },
+        { key: 'cum', h: 'פער מצטבר', w: 14 },
+      ];
+      const hdr3 = header(ws3, 'חשבון תשלומים', `כל הצוות · ${S.data.periods.length} תשלומים · הופק ${stamp}`, cols3);
+      let rr = hdr3 + 1;
+      const chron = S.data.periods.slice().sort((a, b) => (a.closed_at < b.closed_at ? -1 : a.closed_at > b.closed_at ? 1 : a.id - b.id));
+      for (const p of chron) {
+        const a = periodAccount(p);
+        const mins = sumMin(a.list);
+        const row = ws3.getRow(rr);
+        row.values = {
+          name: p.name, closed: p.closed_at ? toDateCell(p.closed_at.slice(0, 10)) : '', n: a.list.length, dec: r2(mins / 60),
+          exp: a.expected, carry: a.carrySum || '', recv: a.received === null ? 'לא הוזן' : a.received,
+          eff: a.received !== null && mins ? { formula: `(G${rr}-N(F${rr}))/D${rr}`, result: r2((a.received - a.carrySum) / (mins / 60)) } : '',
+          gap: a.received === null ? '' : { formula: `E${rr}-G${rr}`, result: a.gap },
+          cum: { formula: rr === hdr3 + 1 ? `N(I${rr})` : `J${rr - 1}+N(I${rr})` },
+        };
+        row.getCell('closed').numFmt = 'd.m.yyyy';
+        row.getCell('dec').numFmt = '0.00';
+        ['exp', 'carry', 'recv', 'eff', 'gap', 'cum'].forEach((k) => (row.getCell(k).numFmt = MONEY));
+        row.getCell('name').alignment = { horizontal: 'right', vertical: 'middle' };
+        rr++;
+      }
+      styleBody(ws3, hdr3 + 1, rr - 1, cols3.length);
+      for (let i = hdr3 + 1; i < rr; i++) {
+        const g = ws3.getRow(i).getCell('gap');
+        g.font = { name: FONT, bold: true, color: { argb: COL.open } };
+      }
+      const bal = balance();
+      const t = ws3.getRow(rr);
+      t.getCell(1).value = bal.total >= 0 ? 'יתרה פתוחה (עוד מגיע)' : 'עודף ששולם';
+      t.getCell(4).value = { formula: `SUM(D${hdr3 + 1}:D${rr - 1})` };
+      t.getCell(5).value = { formula: `SUM(E${hdr3 + 1}:E${rr - 1})` };
+      t.getCell(7).value = { formula: `SUM(G${hdr3 + 1}:G${rr - 1})` };
+      t.getCell(10).value = { formula: `J${rr - 1}`, result: bal.total };
+      totalRow(ws3, rr, cols3.length);
+      t.getCell(4).numFmt = '0.00';
+      [5, 7, 10].forEach((c) => (t.getCell(c).numFmt = MONEY));
+      t.getCell(10).font = { name: FONT, bold: true, size: 13, color: { argb: bal.total > 0 ? COL.open : COL.paid } };
+      // per-worker running balance
+      const wr = rr + 2;
+      ws3.getCell(`A${wr}`).value = 'פער מצטבר לפי עובד';
+      ws3.getCell(`A${wr}`).font = { name: FONT, bold: true, size: 12 };
+      let k = wr + 1;
+      const allW = Object.keys(bal.byW);
+      for (const w of allW) {
+        ws3.getCell(`A${k}`).value = wName(w);
+        ws3.getCell(`B${k}`).value = bal.byW[w];
+        ws3.getCell(`B${k}`).numFmt = MONEY;
+        ws3.getCell(`A${k}`).font = { name: FONT };
+        ws3.getCell(`B${k}`).font = { name: FONT, bold: true, color: { argb: bal.byW[w] > 0 ? COL.open : COL.paid } };
+        k++;
+      }
+      if (!allW.length) { ws3.getCell(`A${k}`).value = 'אין פער — החשבון מאוזן'; ws3.getCell(`A${k}`).font = { name: FONT, color: { argb: COL.paid } }; }
+    }
+
+    const buf = await wb.xlsx.writeBuffer();
+    download(new Blob([buf], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }), fileName('xlsx'));
+    toast('הקובץ ירד ✓');
   }
 
   // ---------- Admin ----------
@@ -1058,7 +1526,7 @@
     worker(id) { workerSheet(id); },
     close: closeSheet,
     saveRate() { act('PUT', '/api/settings', { default_rate: document.getElementById('dr').value }, 'התעריף נשמר'); },
-    csv: exportCsv,
+    csv: exportSheet,
     install: doInstall,
     hideInstall() { INS.hideBanner = true; LS.set('shifts.installHidden', true); render(); },
     logout() { if (confirm('להתנתק?')) { LS.del('shifts.pass'); S.pass = ''; S.data = null; render(); } },

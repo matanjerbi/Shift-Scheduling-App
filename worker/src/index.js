@@ -223,7 +223,7 @@ async function adminLog(db, url) {
 const COLS = {
   shifts: ['date', 'worker_id', 'start_time', 'end_time', 'extra_minutes', 'hours_override', 'note', 'period_id', 'created_at', 'updated_at'],
   workers: ['name', 'rate', 'active', 'created_at'],
-  periods: ['name', 'amount_received', 'note', 'closed_at'],
+  periods: ['name', 'amount_received', 'note', 'closed_at', 'expected_amount', 'carry_json'],
 };
 const TABLE = { shift: 'shifts', worker: 'workers', period: 'periods' };
 // period_id is payment status — it is changed by closing/reopening periods, which have their own undo
@@ -466,9 +466,17 @@ async function handle(req, env, ctx) {
     if (!ids.length) return fail('לא נבחרו משמרות');
     const name = String(b.name || '').trim() || 'תקופה';
     const amount = b.amount_received === '' || b.amount_received == null ? null : Number(b.amount_received);
+    const expected = b.expected_amount === '' || b.expected_amount == null ? null : Number(b.expected_amount);
+    // carry: earlier gaps this payment also covers, as {worker_id: amount}
+    let carry = null;
+    if (b.carry && typeof b.carry === 'object') {
+      const c = {};
+      for (const [k, v] of Object.entries(b.carry)) if (Number(k) > 0 && isFinite(Number(v)) && Number(v) !== 0) c[Number(k)] = Math.round(Number(v) * 100) / 100;
+      if (Object.keys(c).length) carry = JSON.stringify(c);
+    }
     const res = await db
-      .prepare('INSERT INTO periods (name, amount_received, note) VALUES (?, ?, ?)')
-      .bind(name, amount, b.note ? String(b.note) : null)
+      .prepare('INSERT INTO periods (name, amount_received, note, expected_amount, carry_json) VALUES (?, ?, ?, ?, ?)')
+      .bind(name, amount, b.note ? String(b.note) : null, isFinite(expected) ? expected : null, carry)
       .run();
     const pid = res.meta.last_row_id;
     const marks = ids.map((id) =>
