@@ -799,6 +799,46 @@
     setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 2000);
   }
 
+  // Overall status (whole history, worker filter applied): paid, pending, earlier gap, total due now
+  function statusSummary() {
+    const wf = XS.worker === 'all' ? null : Number(XS.worker);
+    const mine = (w) => wf === null || Number(w) === wf;
+    const all = S.data.shifts.filter((s) => mine(s.worker_id));
+    const openL = all.filter((s) => !s.period_id);
+    const paidL = all.filter((s) => s.period_id);
+    let paidExp = 0, recv = 0;
+    const perW = {};
+    const W = (w) => (perW[w] = perW[w] || { n: 0, min: 0, openMin: 0, openExp: 0, paidExp: 0, recv: 0, gap: 0 });
+    for (const s of all) { const r = W(s.worker_id); r.n++; r.min += C.shiftMinutes(s); }
+    for (const s of openL) { const r = W(s.worker_id); r.openMin += C.shiftMinutes(s); }
+    for (const [w, v] of Object.entries(expectedByWorker(openL))) W(w).openExp = r2(v);
+    for (const p of S.data.periods) {
+      const a = periodAccount(p);
+      if (a.received === null) continue;
+      for (const [w, row] of Object.entries(a.rows)) {
+        if (!mine(w)) continue;
+        paidExp += row.expected; recv += row.paid || 0;
+        const r = W(w); r.paidExp += row.expected; r.recv += row.paid || 0; r.gap += row.gap || 0;
+      }
+    }
+    const bal = balance();
+    const prevGap = wf === null ? bal.total : r2(bal.byW[wf] || 0);
+    const openExp = expectedOf(openL);
+    for (const r of Object.values(perW)) { r.gap = r2(r.gap); r.recv = r2(r.recv); r.paidExp = r2(r.paidExp); r.due = r2(r.openExp + r.gap); }
+    const chron = S.data.periods.slice().sort((a, b) => (a.closed_at < b.closed_at ? -1 : a.closed_at > b.closed_at ? 1 : a.id - b.id));
+    let cum = 0;
+    const payments = chron.map((p) => {
+      const a = periodAccount(p);
+      if (a.gap !== null) cum = r2(cum + a.gap);
+      return { name: p.name, closed: p.closed_at ? C.fmtDate(p.closed_at.slice(0, 10)) : '', min: sumMin(a.list), expected: a.expected, carry: a.carrySum, received: a.received, gap: a.gap, cum };
+    });
+    return {
+      who: wf === null ? 'כל העובדים' : wName(wf),
+      allMin: sumMin(all), paidMin: sumMin(paidL), openMin: sumMin(openL), openN: openL.length, paidN: paidL.length,
+      paidExp: r2(paidExp), recv: r2(recv), openExp, prevGap, due: r2(openExp + prevGap), perW, payments,
+    };
+  }
+
   function exportCsv() {
     const periodName = (pid) => (S.data.periods.find((p) => p.id === pid) || {}).name || '';
     const list = exportShifts();
@@ -811,6 +851,31 @@
       rows.push([C.fmtDate(s.date), C.dayName(s.date), wName(s.worker_id), s.start_time || '', s.end_time || '', s.extra_minutes ? C.fmtHM(s.extra_minutes) : '', C.fmtHM(m), C.fmtDec(m), rate, r2((m / 60) * rate).toFixed(2), s.period_id ? 'שולם' : 'ממתין', periodName(s.period_id), s.note || '']);
     });
     rows.push(['סה״כ', '', `${list.length} משמרות`, '', '', '', C.fmtHM(tm), C.fmtDec(tm), '', r2(tx).toFixed(2), '', '', '']);
+    const f2 = (n) => (n === null || n === undefined || n === '' ? '' : r2(Number(n)).toFixed(2));
+    const st = statusSummary();
+    rows.push([]);
+    rows.push([`מצב כללי — ${st.who} (כל ההיסטוריה)`]);
+    rows.push(['', 'שעות', 'משמרות', 'סכום (₪)']);
+    rows.push(['שולם — לפי תעריף', C.fmtDec(st.paidMin), st.paidN, f2(st.paidExp)]);
+    rows.push(['שולם — התקבל בפועל', '', '', f2(st.recv)]);
+    rows.push(['ממתין לתשלום — לפי תעריף', C.fmtDec(st.openMin), st.openN, f2(st.openExp)]);
+    rows.push([st.prevGap >= 0 ? 'פער פתוח מחשבונות קודמים (חסר)' : 'עודף מחשבונות קודמים', '', '', f2(st.prevGap)]);
+    rows.push(['סה״כ מגיע עכשיו (ממתין + פער)', '', '', f2(st.due)]);
+    rows.push([]);
+    rows.push(['לפי עובד']);
+    rows.push(['עובד', 'משמרות', 'שעות', 'ממתין (שעות)', 'ממתין לפי תעריף (₪)', 'שולם לפי תעריף (₪)', 'קיבל (₪)', 'פער מחשבונות קודמים (₪)', 'סה״כ מגיע עכשיו (₪)']);
+    const pw = Object.entries(st.perW);
+    pw.forEach(([w, r]) => rows.push([wName(w), r.n, C.fmtDec(r.min), C.fmtDec(r.openMin), f2(r.openExp), f2(r.paidExp), f2(r.recv), f2(r.gap), f2(r.due)]));
+    rows.push(['סה״כ', pw.reduce((a, [, r]) => a + r.n, 0), C.fmtDec(st.allMin), C.fmtDec(st.openMin), f2(st.openExp), f2(st.paidExp), f2(st.recv), f2(st.prevGap), f2(st.due)]);
+    if (st.payments.length) {
+      rows.push([]);
+      rows.push(['חשבון תשלומים (כל הצוות)']);
+      rows.push(['תקופה', 'נסגר', 'שעות', 'לפי תעריף (₪)', 'השלמת פער קודם (₪)', 'התקבל (₪)', 'פער (₪)', 'פער מצטבר (₪)']);
+      st.payments.forEach((p) => rows.push([p.name, p.closed, C.fmtDec(p.min), f2(p.expected), p.carry ? f2(p.carry) : '', p.received === null ? 'לא הוזן' : f2(p.received), f2(p.gap), f2(p.cum)]));
+    }
+    rows.push([]);
+    rows.push(['פער = לפי תעריף פחות מה שהתקבל. חיובי = עוד מגיע כסף, שלילי = שולם יותר.']);
+    rows.push([`הופק ${new Date().toLocaleString('he-IL')}`]);
     const csv = '﻿' + rows.map((r) => r.map((v) => '"' + String(v).replace(/"/g, '""') + '"').join(',')).join('\r\n');
     download(new Blob([csv], { type: 'text/csv;charset=utf-8' }), fileName('csv'));
   }
@@ -906,6 +971,61 @@
       row.height = 22;
     }
     const toDateCell = (d) => { const [y, m, dd] = d.split('-').map(Number); return new Date(Date.UTC(y, m - 1, dd)); };
+
+    // ----- Sheet 0: overall status -----
+    {
+      const st = statusSummary();
+      const w0 = wb.addWorksheet('מצב כללי', { properties: { tabColor: { argb: COL.open } } });
+      const c0 = [{ key: 'l', h: '', w: 34 }, { key: 'h', h: 'שעות', w: 12 }, { key: 'n', h: 'משמרות', w: 11 }, { key: 'v', h: 'סכום', w: 16 }];
+      header(w0, `מצב כללי — ${st.who}`, `כל ההיסטוריה · הופק ${stamp}`, c0);
+      const lines = [
+        ['שולם — לפי תעריף', st.paidMin / 1440, st.paidN, st.paidExp],
+        ['שולם — התקבל בפועל', '', '', st.recv],
+        ['ממתין לתשלום — לפי תעריף', st.openMin / 1440, st.openN, st.openExp],
+        [st.prevGap >= 0 ? 'פער פתוח מחשבונות קודמים (חסר)' : 'עודף מחשבונות קודמים', '', '', st.prevGap],
+      ];
+      lines.forEach((ln, i) => {
+        const row = w0.getRow(5 + i);
+        row.values = ln;
+        row.getCell(2).numFmt = HM; row.getCell(4).numFmt = MONEY;
+        row.getCell(1).alignment = { horizontal: 'right', vertical: 'middle', indent: 1 };
+      });
+      styleBody(w0, 5, 4 + lines.length, 4);
+      for (let i = 0; i < lines.length; i++) w0.getRow(5 + i).getCell(1).alignment = { horizontal: 'right', vertical: 'middle', indent: 1 };
+      w0.getRow(8).getCell(4).font = { name: FONT, bold: true, color: { argb: st.prevGap > 0 ? COL.open : COL.paid } };
+      const t = w0.getRow(5 + lines.length);
+      t.getCell(1).value = 'סה״כ מגיע עכשיו (ממתין + פער)';
+      t.getCell(4).value = { formula: 'D7+D8', result: st.due };
+      totalRow(w0, 5 + lines.length, 4);
+      t.getCell(1).alignment = { horizontal: 'right', vertical: 'middle', indent: 1 };
+      t.getCell(4).numFmt = MONEY;
+      t.getCell(4).font = { name: FONT, bold: true, size: 14, color: { argb: COL.brand } };
+      t.height = 26;
+      // per worker
+      const pr = 5 + lines.length + 2;
+      const ph = ['עובד', 'ממתין (שעות)', 'ממתין לפי תעריף', 'פער קודם', 'מגיע עכשיו'];
+      w0.getCell(`A${pr - 1}`).value = 'לפי עובד';
+      w0.getCell(`A${pr - 1}`).font = { name: FONT, bold: true, size: 12 };
+      ['A', 'B', 'C', 'D', 'E'].forEach((L, i) => {
+        const c = w0.getCell(`${L}${pr}`);
+        c.value = ph[i]; c.font = { name: FONT, bold: true, color: { argb: 'FFFFFFFF' } }; c.fill = fill(COL.brand); c.alignment = { horizontal: 'center' };
+      });
+      w0.getColumn(5).width = 16;
+      w0.getColumn(2).width = 15;
+      w0.getColumn(3).width = 17;
+      let k = pr + 1;
+      for (const [w, r] of Object.entries(st.perW)) {
+        const row = w0.getRow(k);
+        row.values = [wName(w), r.openMin / 1440, r.openExp, r.gap, { formula: `C${k}+D${k}`, result: r.due }];
+        row.getCell(2).numFmt = HM; [3, 4, 5].forEach((c) => (row.getCell(c).numFmt = MONEY));
+        k++;
+      }
+      styleBody(w0, pr + 1, k - 1, 5);
+      for (let i = pr + 1; i < k; i++) w0.getRow(i).getCell(5).font = { name: FONT, bold: true };
+      const note = w0.getCell(`A${k + 1}`);
+      note.value = 'פער = לפי תעריף פחות מה שהתקבל. חיובי = עוד מגיע כסף, שלילי = שולם יותר.';
+      note.font = { name: FONT, size: 10, italic: true, color: { argb: COL.muted } };
+    }
 
     // ----- Sheet 1: shifts -----
     const ws = wb.addWorksheet('משמרות', { properties: { tabColor: { argb: COL.accent } } });
