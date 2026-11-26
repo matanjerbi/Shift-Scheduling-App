@@ -124,11 +124,12 @@ async function audit(db, ctx, action, entity, id, before, after) {
 const row = (db, table, id) => db.prepare(`SELECT * FROM ${table} WHERE id = ?`).bind(id).first();
 
 async function state(db) {
-  const [workers, shifts, periods, settings] = await db.batch([
+  const [workers, shifts, periods, settings, payouts] = await db.batch([
     db.prepare('SELECT * FROM workers ORDER BY id'),
     db.prepare('SELECT * FROM shifts ORDER BY date DESC, start_time DESC, id DESC'),
     db.prepare('SELECT * FROM periods ORDER BY closed_at DESC, id DESC'),
     db.prepare("SELECT * FROM settings WHERE key NOT LIKE 'admin_%'"),
+    db.prepare('SELECT * FROM payouts ORDER BY paid_at DESC, id DESC'),
   ]);
   const s = {};
   for (const r of settings.results) s[r.key] = r.value;
@@ -136,6 +137,7 @@ async function state(db) {
     workers: workers.results,
     shifts: shifts.results,
     periods: periods.results,
+    payouts: payouts.results,
     settings: { default_rate: Number(s.default_rate) || 0 },
   };
 }
@@ -224,8 +226,9 @@ const COLS = {
   shifts: ['date', 'worker_id', 'start_time', 'end_time', 'extra_minutes', 'hours_override', 'note', 'period_id', 'created_at', 'updated_at'],
   workers: ['name', 'rate', 'active', 'created_at'],
   periods: ['name', 'amount_received', 'note', 'closed_at', 'expected_amount', 'carry_json'],
+  payouts: ['worker_id', 'amount', 'paid_at', 'note', 'created_at'],
 };
-const TABLE = { shift: 'shifts', worker: 'workers', period: 'periods' };
+const TABLE = { shift: 'shifts', worker: 'workers', period: 'periods', payout: 'payouts' };
 // period_id is payment status — it is changed by closing/reopening periods, which have their own undo
 const IGNORE = new Set(['created_at', 'updated_at', 'shift_ids', 'period_id']);
 
@@ -510,6 +513,32 @@ async function handle(req, env, ctx) {
       db.prepare('DELETE FROM periods WHERE id = ?').bind(id),
     ]);
     if (before) await audit(db, ctx, 'reopen', 'period', id, { ...before, shift_ids: shiftIds }, null);
+    return json(await state(db));
+  }
+
+  // Payouts: money passed on to a worker
+  if (path === '/api/payouts' && m === 'POST') {
+    const b = await readBody(req);
+    const wid = Number(b.worker_id);
+    const amount = Math.round(Number(b.amount) * 100) / 100;
+    const paidAt = String(b.paid_at || '');
+    if (!(wid > 0) || !(await row(db, 'workers', wid))) return fail('חסר עובד');
+    if (!isFinite(amount) || amount === 0) return fail('סכום לא תקין');
+    if (!DATE_RE.test(paidAt)) return fail('תאריך לא תקין');
+    const res = await db
+      .prepare('INSERT INTO payouts (worker_id, amount, paid_at, note) VALUES (?, ?, ?, ?)')
+      .bind(wid, amount, paidAt, b.note ? String(b.note).slice(0, 300) : null)
+      .run();
+    const id = res.meta.last_row_id;
+    await audit(db, ctx, 'create', 'payout', id, null, await row(db, 'payouts', id));
+    return json(await state(db));
+  }
+  mm = path.match(/^\/api\/payouts\/(\d+)$/);
+  if (mm && m === 'DELETE') {
+    const id = Number(mm[1]);
+    const before = await row(db, 'payouts', id);
+    await db.prepare('DELETE FROM payouts WHERE id = ?').bind(id).run();
+    if (before) await audit(db, ctx, 'delete', 'payout', id, before, null);
     return json(await state(db));
   }
 
